@@ -253,9 +253,13 @@ private fun FavoriteRow(
             .zIndex(if (isPinned) 1f else 0f)
             .fillMaxWidth()
             .graphicsLayer { translationX = animatedOffset.value }
-            // 圆润卡片：整体裁剪圆角 + 浅色底（去掉分隔线，收藏列表更柔和）
+            // 圆润卡片：整体裁剪圆角；置顶消息与对话主页置顶对话同色（primaryContainer），
+            // 未置顶用浅色底（去掉分隔线，收藏列表更柔和）
             .clip(RoundedCornerShape(18.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .background(
+                if (isPinned) MaterialTheme.colorScheme.primaryContainer
+                else MaterialTheme.colorScheme.surfaceVariant
+            )
             // pointerInput 以 isPinned 为 key：置顶状态变化时重启手势检测，
             // 避免旧的检测器继续消费拖动手势导致"拖了没反应/状态错乱"
             .pointerInput(isPinned) {

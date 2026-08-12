@@ -5,8 +5,8 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.Spring
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -61,7 +62,6 @@ import com.yourapp.chat.data.local.dao.ConversationWithLast
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import kotlin.math.min
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 
@@ -231,14 +231,14 @@ private fun ConversationRow(
 ) {
     val density = LocalDensity.current
     val thresholdPx = with(density) { 80.dp.toPx() }
-    
+
     // 拖动偏移动画
     var dragOffset by remember { mutableStateOf(0f) }
     val animatedOffset = animateFloatAsState(
         targetValue = dragOffset,
         animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow)
     )
-    
+
     // 置顶图标动画状态
     val isPinned = item.conversation.pinned
     var pinRotation by remember { mutableStateOf(0f) }
@@ -246,7 +246,7 @@ private fun ConversationRow(
         targetValue = pinRotation,
         animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium)
     )
-    
+
     // 触发置顶动画
     LaunchedEffect(isPinned) {
         pinRotation = if (isPinned) 360f else 0f
@@ -256,16 +256,12 @@ private fun ConversationRow(
         modifier = modifier
             // 置顶条目抬升 z 序：置顶瞬间条目会从列表后方位置飞到顶部，
             // 若不抬升，它在重排后是列表第一个子项（先绘制），会被飞越的其余条目盖住
-            // （表现为"动画从消息后面钻过去"）。取消置顶往下飞行时它是末尾子项（后绘制），
-            // 天然在最上层，所以只有置顶态需要抬升。
             .zIndex(if (isPinned) 1f else 0f)
             .fillMaxWidth()
             // 置顶/取消置顶后列表重排：条目标平滑飞移到新位置（含飞到顶部）
-            // 用 graphicsLayer 位移避免每次动画帧触发重新布局，提升多对话滚动流畅度
+            // 用 graphicsLayer 位移避免每次动画帧触发重新布局
             .graphicsLayer { translationX = animatedOffset.value }
-            // isPinned 作为 key：置顶/取消置顶后列表重排、条目仍在组合中（animateItem），
-            // 若 key 固定为 Unit，闭包里的 isPinned 永远是旧值 → 置顶后右滑变成"再次置顶"、
-            // 左滑也不生效（表现为"置顶失灵"）。key 跟随 isPinned 重启手势即可。
+            // isPinned 作为 key：置顶/取消置顶后列表状态变化，key 跟随 isPinned 重启手势即可
             .pointerInput(isPinned) {
                 var total = 0f
                 detectHorizontalDragGestures(
@@ -279,7 +275,7 @@ private fun ConversationRow(
                             // 未置顶：向右拖动显示置顶预览
                             dragOffset = if (total > 0) kotlin.math.min(total, thresholdPx * 1.5f) else 0f
                         } else {
-                            // 已置顶：左右双向拖动均可取消置顶（含右滑）
+                            // 已置顶：左右双向拖动均可取消置顶
                             dragOffset = when {
                                 total < 0 -> kotlin.math.max(total, -thresholdPx * 1.5f)
                                 total > 0 -> kotlin.math.min(total, thresholdPx * 1.5f)
@@ -321,8 +317,8 @@ private fun ConversationRow(
         // 置顶图标带旋转动画
         if (isPinned) {
             Icon(
-                Icons.Filled.PushPin, 
-                contentDescription = "已置顶", 
+                Icons.Filled.PushPin,
+                contentDescription = "已置顶",
                 tint = MaterialTheme.colorScheme.primary,
                 modifier = Modifier
                     .graphicsLayer { rotationZ = animatedPinRotation.value }
@@ -331,7 +327,7 @@ private fun ConversationRow(
         } else {
             // 拖动预览图标 + 默认图标。
             // 用普通 if/else 替代 AnimatedVisibility：列表行内的 AnimatedVisibility 在滚动
-            // 组合新行时会为每行创建整套过渡状态机，多对话长列表滚动明显卡顿；预览图标
+            // 组合新行时会为每行创建整套过渡状态机，长列表滚动明显卡顿；预览图标
             // 本来也不需要动画，直接按拖动状态切换即可。
             val showPinPreview = dragOffset > thresholdPx * 0.3f
             val showUnpinPreview = dragOffset < -thresholdPx * 0.3f

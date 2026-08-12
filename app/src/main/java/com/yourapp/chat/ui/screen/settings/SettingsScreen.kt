@@ -74,6 +74,7 @@ fun SettingsScreen(
     val configRepo = remember { ChatApplication.instance.configRepository }
     var streamingEnabled by remember { mutableStateOf(configRepo.isStreamingEnabled()) }
     var nickname by remember { mutableStateOf(configRepo.getNickname()) }
+    var darkMode by remember { mutableStateOf(configRepo.getDarkMode()) }
     var persona by remember { mutableStateOf(configRepo.getPersona()) }
     var showAbout by remember { mutableStateOf(false) }
     var showExportConfirm by remember { mutableStateOf(false) }
@@ -250,7 +251,30 @@ fun SettingsScreen(
                     )
                 }
                 if (streamingEnabled) {
-                    HorizontalDivider(Modifier.padding(vertical = 8.dp))
+// 深色模式：独立开关（不跟随系统），切换时全局颜色由浅到深/由深到浅平滑过渡
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("深色模式", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "独立于系统设置，切换时颜色平滑过渡",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                }
+                Switch(
+                    checked = darkMode,
+                    onCheckedChange = {
+                        darkMode = it
+                        ChatApplication.instance.setDarkMode(it)
+                    }
+                )
+            }
+            HorizontalDivider(Modifier.padding(vertical = 8.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically
