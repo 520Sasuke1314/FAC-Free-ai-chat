@@ -12,6 +12,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -238,7 +239,14 @@ fun ChatScreen(
     val conv = state.conversation
     // 是否官网免费对话（deepseek_web）：决定设置项、消息操作与时间显示
     val isWeb = state.apiProfiles.firstOrNull { it.id == state.selectedProfileId }?.provider == "deepseek_web"
-    if (state.showSettings && conv != null) {
+    // 聊天页 ↔ 对话设置页：与导航页面切换相同的淡入淡出（Crossfade 交叉溶解，
+    // 过渡期两层短暂共存，结束后不含残留透明层，滚动性能不受影响）
+    Crossfade(
+        targetState = state.showSettings && conv != null,
+        animationSpec = tween(260),
+        label = "chatSettingsCrossfade"
+    ) { isSettings ->
+        if (isSettings && conv != null) {
         ChatSettingsPage(
             conversation = conv,
             keepCount = state.compressKeepCount,
@@ -312,7 +320,7 @@ fun ChatScreen(
                 onDismiss = { vm.toggleVisionModelPicker() }
             )
         }
-        return
+        return@Crossfade
     }
 
     // 使用 derivedStateOf 优化流式内容解析，避免每帧重新计算正。?    // 思考链已与正文分开展示：优先取 streamingThinking；非流式/旧数据时回退解析拼接内容
@@ -895,6 +903,7 @@ val reversedMessages = remember(state.messages) { state.messages.asReversed() }
             onSelect = { id -> vm.rewrite(id); vm.toggleRewritePicker() },
             onDismiss = { vm.toggleRewritePicker() }
         )
+    }
     }
 }
 

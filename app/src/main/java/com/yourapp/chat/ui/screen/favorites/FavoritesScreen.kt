@@ -65,6 +65,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -247,6 +248,9 @@ private fun FavoriteRow(
 
     Row(
         modifier = modifier
+            // 置顶条目抬升 z 序：置顶后会变成列表第一个子项（先绘制），
+            // 飞行动画会被其余条目盖住；抬升后置顶动画始终浮在最上层
+            .zIndex(if (isPinned) 1f else 0f)
             .fillMaxWidth()
             .graphicsLayer { translationX = animatedOffset.value }
             // 圆润卡片：整体裁剪圆角 + 浅色底（去掉分隔线，收藏列表更柔和）

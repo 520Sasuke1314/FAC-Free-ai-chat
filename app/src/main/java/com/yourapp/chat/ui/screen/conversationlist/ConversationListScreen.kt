@@ -49,6 +49,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
@@ -239,6 +240,11 @@ private fun ConversationRow(
 
     Row(
         modifier = modifier
+            // 置顶条目抬升 z 序：置顶瞬间条目会从列表后方位置飞到顶部，
+            // 若不抬升，它在重排后是列表第一个子项（先绘制），会被飞越的其余条目盖住
+            // （表现为"动画从消息后面钻过去"）。取消置顶往下飞行时它是末尾子项（后绘制），
+            // 天然在最上层，所以只有置顶态需要抬升。
+            .zIndex(if (isPinned) 1f else 0f)
             .fillMaxWidth()
             // 置顶/取消置顶后列表重排：条目标平滑飞移到新位置（含飞到顶部）
             // 用 graphicsLayer 位移避免每次动画帧触发重新布局，提升多对话滚动流畅度
