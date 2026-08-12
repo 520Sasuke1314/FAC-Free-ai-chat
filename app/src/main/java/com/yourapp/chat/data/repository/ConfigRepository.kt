@@ -22,6 +22,13 @@ class ConfigRepository(
         prefs.edit().putBoolean("streaming_enabled", enabled).apply()
     }
 
+    /** 流式刷新频率（毫秒）：UI 推送间隔。50/100/200/500 可选，默认 100ms（≈10fps） */
+    fun getStreamRefreshMs(): Int = prefs.getInt("stream_refresh_ms", 100)
+
+    fun setStreamRefreshMs(ms: Int) {
+        prefs.edit().putInt("stream_refresh_ms", ms).apply()
+    }
+
     /** 用户昵称（个人信息） */
     fun getNickname(): String = prefs.getString("nickname", "").orEmpty()
 

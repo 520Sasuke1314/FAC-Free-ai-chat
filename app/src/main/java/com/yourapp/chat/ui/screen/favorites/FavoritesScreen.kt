@@ -7,9 +7,11 @@ import androidx.compose.animation.core.Spring
 import android.content.Context
 import android.widget.Toast
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -21,9 +23,11 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
@@ -58,6 +62,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
@@ -76,6 +81,9 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.math.min
 import kotlin.math.roundToInt
+
+/** 收藏行时间格式（缓存，避免列表滚动/重组时反复 new） */
+private val RowTimeFmt = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -172,7 +180,11 @@ fun FavoritesScreen(
                 )
             }
         } else {
-            LazyColumn(Modifier.fillMaxSize().padding(padding)) {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize().padding(padding),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 items(state.items, key = { it.message.id }, contentType = { "favorite" }) { item ->
                     FavoriteRow(
                         item = item,
@@ -189,7 +201,6 @@ fun FavoritesScreen(
                         },
                         onSwipeRight = { if (!state.isSelectionMode) vm.togglePinFavorite(item.message.id, !item.message.pinned) }
                     )
-                    HorizontalDivider()
                 }
             }
         }
@@ -234,7 +245,12 @@ private fun FavoriteRow(
         modifier = modifier
             .fillMaxWidth()
             .graphicsLayer { translationX = animatedOffset.value }
-            .pointerInput(Unit) {
+            // 圆润卡片：整体裁剪圆角 + 浅色底（去掉分隔线，收藏列表更柔和）
+            .clip(RoundedCornerShape(18.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
+            // pointerInput 以 isPinned 为 key：置顶状态变化时重启手势检测，
+            // 避免旧的检测器继续消费拖动手势导致"拖了没反应/状态错乱"
+            .pointerInput(isPinned) {
                 var total = 0f
                 detectHorizontalDragGestures(
                     onDragStart = {
@@ -263,7 +279,7 @@ private fun FavoriteRow(
                 )
             }
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+            .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         if (selectionMode) {
@@ -313,7 +329,7 @@ private fun FavoriteRow(
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    text = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(item.message.timestamp)),
+                    text = RowTimeFmt.format(Date(item.message.timestamp)),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.outline
                 )

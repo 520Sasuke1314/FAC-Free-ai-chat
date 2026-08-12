@@ -31,6 +31,7 @@ class FavoritesViewModel(
     private val configRepository: ConfigRepository
 ) : ViewModel() {
 
+    private var lastPinToggleAt = 0L
     private val _uiState = MutableStateFlow(FavoritesUiState())
     val uiState: StateFlow<FavoritesUiState> = _uiState.asStateFlow()
 
@@ -69,10 +70,16 @@ class FavoritesViewModel(
         _uiState.update { it.copy(selectedIds = emptySet(), isSelectionMode = false) }
     }
 
-    /** 右滑置顶 / 取消置顶收藏 */
+    /** 右滑置顶 / 取消置顶收藏（带防抖：快速连滑时忽略冷却期内的重复请求，避免置顶结果被覆盖） */
     fun togglePinFavorite(messageId: Long, pinned: Boolean) {
+        val now = System.currentTimeMillis()
+        if (now - lastPinToggleAt < PIN_COOLDOWN_MS) return
+        lastPinToggleAt = now
         viewModelScope.launch {
             chatRepository.toggleMessagePinned(messageId, pinned)
+            _uiState.update {
+                it.copy(info = if (pinned) "已置顶该收藏" else "已取消置顶")
+            }
         }
     }
 
@@ -96,6 +103,9 @@ class FavoritesViewModel(
     }
 
     companion object {
+        /** 置顶/取消置顶防抖间隔（毫秒），与收藏行手势配合防连滑 */
+        private const val PIN_COOLDOWN_MS = 700L
+
         val Factory: ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T {

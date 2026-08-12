@@ -120,16 +120,40 @@ fun WorldListScreen(onBack: () -> Unit, showBack: Boolean = true) {
                 }
             }
             items(state.books, key = { it.id }) { book ->
-                WorldBookSection(
+                WorldBookCardHeader(
                     book = book,
-                    entries = state.entriesByBook[book.id].orEmpty(),
                     loaded = state.entriesByBook.containsKey(book.id),
-                    onExpand = { vm.openBook(book.id) },
+                    expanded = state.expandedBookIds.contains(book.id),
+                    entryCount = state.entriesByBook[book.id].orEmpty().size,
+                    onToggle = { vm.toggleBookExpanded(book.id) },
                     onRename = { newName -> vm.renameBook(book, newName) },
-                    onDeleteBook = { vm.deleteBook(book) },
-                    onDeleteEntry = { vm.delete(it) },
-                    onEditEntry = { vm.openEdit(it) }
+                    onDeleteBook = { vm.deleteBook(book) }
                 )
+            }
+
+            // 展开的集合条目：拆成独立可虚拟化的行，避免大集合（几百条目）
+            // 在单个 item 里 forEach 整段组合导致滚动卡顿
+            state.books.forEach { book ->
+                if (state.expandedBookIds.contains(book.id)) {
+                    val entries = state.entriesByBook[book.id].orEmpty()
+                    if (entries.isEmpty()) {
+                        item(key = "book_empty_${book.id}") {
+                            Text(
+                                "该世界书没有条目",
+                                modifier = Modifier.padding(horizontal = 24.dp, vertical = 10.dp),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    } else {
+                        items(entries, key = { it.id }) { entry ->
+                            ExpandedEntryRow(
+                                entry = entry,
+                                onDelete = { vm.delete(entry) },
+                                onEdit = { vm.openEdit(entry) }
+                            )
+                        }
+                    }
+                }
             }
 
             // 手动添加的条目
@@ -168,17 +192,15 @@ fun WorldListScreen(onBack: () -> Unit, showBack: Boolean = true) {
 }
 
 @Composable
-private fun WorldBookSection(
+private fun WorldBookCardHeader(
     book: WorldBookEntity,
-    entries: List<WorldEntryEntity>,
     loaded: Boolean,
-    onExpand: () -> Unit,
+    expanded: Boolean,
+    entryCount: Int,
+    onToggle: () -> Unit,
     onRename: (String) -> Unit,
-    onDeleteBook: () -> Unit,
-    onDeleteEntry: (WorldEntryEntity) -> Unit,
-    onEditEntry: (WorldEntryEntity) -> Unit
+    onDeleteBook: () -> Unit
 ) {
-    var expanded by remember { mutableStateOf(false) }
     var showRenameDialog by remember { mutableStateOf(false) }
     Surface(
         modifier = Modifier
@@ -192,10 +214,7 @@ private fun WorldBookSection(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable {
-                        if (!loaded) onExpand()
-                        expanded = !expanded
-                    }
+                    .clickable(onClick = onToggle)
                     .padding(12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -204,7 +223,7 @@ private fun WorldBookSection(
                 Column(Modifier.weight(1f)) {
                     Text(book.name, style = MaterialTheme.typography.titleSmall)
                     Text(
-                        text = if (loaded) "${entries.size} 条设定 · 点击${if (expanded) "收起" else "展开"}"
+                        text = if (loaded) "$entryCount 条设定 · 点击${if (expanded) "收起" else "展开"}"
                         else "点击加载",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.outline
@@ -220,22 +239,6 @@ private fun WorldBookSection(
                 }
             }
             HorizontalDivider()
-            if (expanded && loaded) {
-                if (entries.isEmpty()) {
-                    Text(
-                        "该世界书没有条目",
-                        modifier = Modifier.padding(12.dp),
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-                entries.forEach { entry ->
-                    ExpandedEntryRow(
-                        entry = entry,
-                        onDelete = { onDeleteEntry(entry) },
-                        onEdit = { onEditEntry(entry) }
-                    )
-                }
-            }
         }
     }
 

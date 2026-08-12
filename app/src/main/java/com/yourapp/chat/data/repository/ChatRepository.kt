@@ -11,6 +11,7 @@ import com.yourapp.chat.data.remote.AnthropicClient
 import com.yourapp.chat.data.remote.SseClient
 import com.yourapp.chat.data.remote.model.ChatRequest
 import com.yourapp.chat.data.remote.model.Message
+import com.google.gson.JsonObject
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
@@ -32,13 +33,18 @@ class ChatRepository(
     companion object {
         /** 注入频率：每 N 句对话注入一次世界信息（减少 token 占用，同时保证设定新鲜度） */
         const val INJECTION_INTERVAL = 25
+    }
 
-        /**
-         * 流式正文推送节流间隔（毫秒）。每收到一个 token 就回调 onContent 会触发整棵 UI 树
-         * 重组与 O(n) 的 sb.toString()，长文本流式时 CPU 负载极高。这里限制为每隔一段时间
-         * 推送一次，结束前必定 flush 一次完整内容，肉眼几乎无感知但大幅降低负载。
-         */
-        private const val UI_PUSH_INTERVAL_MS = 100L
+    /**
+     * 深度思考（新版协议）对象：
+     * - 关闭：DeepSeek 官方 API 下发 {"type":"disabled"}（api.deepseek.com 只认新协议，
+     *   旧字段 thinking_enabled 会被忽略导致「关了还在思考」）；
+     * - 开启：仅 DeepSeek 官方 API 下发 {"type":"enabled"}（使默认不思考的模型显式思考）；
+     * - 其他接口一律不发送（OpenAI 等对未知参数会 400，且旧字段已由 thinking_enabled 覆盖）。
+     */
+    private fun buildThinkingJson(enabled: Boolean, provider: String): JsonObject? {
+        if (provider != "deepseek") return null
+        return JsonObject().apply { addProperty("type", if (enabled) "enabled" else "disabled") }
     }
 
     /** 是否注入轮次：第 1 轮必然注入，之后每 N 轮注入一次（interval=0 表示每轮都注入） */
@@ -297,7 +303,9 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                     images = imageDataUrls,
                     // 关闭深度思考时显式下发 thinking_enabled=false；
                     // 开启时不发送该字段，避免不兼容的第三方接口报错
-                    thinking_enabled = if (!thinkingEnabled) false else null
+                    thinking_enabled = if (!thinkingEnabled) false else null,
+                    // DeepSeek 官方 API 的新协议 thinking 对象（旧字段会被官方忽略）
+                    thinking = buildThinkingJson(thinkingEnabled, cfg.provider)
                 )
                 streamSseReply(
                     conversationId = conversationId,
@@ -375,11 +383,14 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         val webRepo = deepSeekWebRepo ?: throw IllegalStateException("官网通道未初始化")
         if (!webRepo.hasToken()) throw IllegalStateException("未登录 DeepSeek 官网账号")
         val streaming = configRepo.isStreamingEnabled()
+        // 流式刷新频率（毫秒）：正文与思考链推送共用同一节流间隔（设置页可调）
+        val pushInterval = configRepo.getStreamRefreshMs().toLong().coerceIn(10L, 2000L)
         var thinkingText = StringBuilder()
         // 流式期间不写库：完整内容经 onContent 回调节流推送（内存态驱动 UI），
         // 避免每次写库触发 Room 全列表刷新导致的界面卡顿。仅在结束时落盘一次。
         val originalTimestamp = db.messageDao().getById(assistantId)?.timestamp
         var lastUiPush = 0L
+        var lastThinkPush = 0L
         try {
             val webFlow = if (regenerateChildMessageId != null) {
                 // 官网重新生成：专用 /regenerate 端点，服务器复用原用户消息、直接替换该回复
@@ -390,8 +401,12 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                     searchEnabled = searchEnabled,
                     onThinking = { t ->
                         thinkingText.append(t)
-                        // 思考链实时推送（思考逐段增长，UI 单独展示）
-                        onThinking(thinkingText.toString())
+                        // 思考链按刷新频率节流推送（思考逐段增长，UI 单独展示）
+                        val now = System.currentTimeMillis()
+                        if (now - lastThinkPush >= pushInterval) {
+                            onThinking(thinkingText.toString())
+                            lastThinkPush = now
+                        }
                     }
                 )
             } else {
@@ -404,8 +419,12 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                     parentMessageIdOverride = parentOverride,
                     onThinking = { t ->
                         thinkingText.append(t)
-                        // 思考链实时推送（思考逐段增长，UI 单独展示）
-                        onThinking(thinkingText.toString())
+                        // 思考链按刷新频率节流推送（思考逐段增长，UI 单独展示）
+                        val now = System.currentTimeMillis()
+                        if (now - lastThinkPush >= pushInterval) {
+                            onThinking(thinkingText.toString())
+                            lastThinkPush = now
+                        }
                     }
                 )
             }
@@ -414,8 +433,8 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                 onToken(token)
                 if (streaming) {
                     val now = System.currentTimeMillis()
-                    // 节流推送正文，避免每 token 触发 UI 重组导致 CPU 飙升
-                    if (now - lastUiPush >= UI_PUSH_INTERVAL_MS) {
+                    // 节流推送正文（间隔由设置页「刷新频率」控制），避免每 token 触发 UI 重组导致 CPU 飙升
+                    if (now - lastUiPush >= pushInterval) {
                         onContent(sb.toString())
                         lastUiPush = now
                     }
@@ -427,6 +446,7 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
             if (sb.isNotEmpty()) {
                 val partial = if (thinkingText.isNotEmpty()) "[思考]${thinkingText}[/思考]\n\n$sb" else sb.toString()
                 onContent(partial)
+                if (thinkingText.isNotEmpty()) onThinking(thinkingText.toString())
                 db.messageDao().update(
                     MessageEntity(
                         id = assistantId,
@@ -444,6 +464,7 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         if (sb.isEmpty() && thinkingText.isEmpty()) {
             throw java.io.IOException("官网本次未返回任何内容（parent_message_id 可能无效）。请稍后重试或改用标准 API。")
         }
+        if (thinkingText.isNotEmpty()) onThinking(thinkingText.toString())
         onContent(finalContent)
         db.messageDao().update(
             MessageEntity(
@@ -473,28 +494,37 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         onThinking: (String) -> Unit = {}
     ) {
         val streaming = configRepo.isStreamingEnabled()
+        // 流式刷新频率（毫秒）：正文与思考链推送共用同一节流间隔（设置页可调）
+        val pushInterval = configRepo.getStreamRefreshMs().toLong().coerceIn(10L, 2000L)
         // 流式期间不写库：完整内容经 onContent 回调节流推送（内存态驱动 UI），
         // 避免每次写库触发 Room 全列表刷新导致的界面卡顿。仅在结束时落盘一次。
         val originalTimestamp = db.messageDao().getById(assistantId)?.timestamp
         var lastUiPush = 0L
+        var lastThinkPush = 0L
         var thinkingText = StringBuilder()
         try {
         chatStream(cfg, request, onThinking = { t ->
             thinkingText.append(t)
-            onThinking(thinkingText.toString())
+            // 思考链按刷新频率节流推送（思考逐段增长，UI 单独展示）
+            val now = System.currentTimeMillis()
+            if (now - lastThinkPush >= pushInterval) {
+                onThinking(thinkingText.toString())
+                lastThinkPush = now
+            }
         }).collect { token ->
             sb.append(token)
             onToken(token)
             if (streaming) {
                 val now = System.currentTimeMillis()
-                // 节流推送正文，避免每 token 触发 UI 重组导致 CPU 飙升
-                if (now - lastUiPush >= UI_PUSH_INTERVAL_MS) {
+                // 节流推送正文（间隔由设置页「刷新频率」控制），避免每 token 触发 UI 重组导致 CPU 飙升
+                if (now - lastUiPush >= pushInterval) {
                     onContent(sb.toString())
                     lastUiPush = now
                 }
             }
         }
         val finalContent = if (thinkingText.isNotEmpty()) "[思考]${thinkingText}[/思考]\n\n$sb" else sb.toString()
+        if (thinkingText.isNotEmpty()) onThinking(thinkingText.toString())
         onContent(finalContent)
         db.messageDao().update(
             MessageEntity(
@@ -512,6 +542,7 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         if (sb.isNotEmpty()) {
             val partial = if (thinkingText.isNotEmpty()) "[思考]${thinkingText}[/思考]\n\n$sb" else sb.toString()
             onContent(partial)
+            if (thinkingText.isNotEmpty()) onThinking(thinkingText.toString())
             db.messageDao().update(
                 MessageEntity(
                     id = assistantId,
@@ -661,7 +692,9 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                     top_p = convSettings?.topP?.takeIf { it >= 0 },
                     top_k = convSettings?.topK?.takeIf { it > 0 },
                     // 关闭深度思考时显式下发 thinking_enabled=false
-                    thinking_enabled = if (!thinkingEnabled) false else null
+                    thinking_enabled = if (!thinkingEnabled) false else null,
+                    // DeepSeek 官方 API 的新协议 thinking 对象（旧字段会被官方忽略）
+                    thinking = buildThinkingJson(thinkingEnabled, cfg.provider)
                 )
                 streamSseReply(
                     conversationId = conversationId,
@@ -802,7 +835,9 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                     top_p = convSettings?.topP?.takeIf { it >= 0 },
                     top_k = convSettings?.topK?.takeIf { it > 0 },
                     // 关闭深度思考时显式下发 thinking_enabled=false
-                    thinking_enabled = if (!thinkingEnabled) false else null
+                    thinking_enabled = if (!thinkingEnabled) false else null,
+                    // DeepSeek 官方 API 的新协议 thinking 对象（旧字段会被官方忽略）
+                    thinking = buildThinkingJson(thinkingEnabled, cfg.provider)
                 )
                 streamSseReply(
                     conversationId = conversationId,

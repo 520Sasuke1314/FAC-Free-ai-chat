@@ -162,9 +162,10 @@ fun ConversationListScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 items(state.conversations, key = { it.conversation.id }, contentType = { "conversation" }) { item ->
+                    // 不使用 animateItem：行内位移动画会持续占用合成线程（置顶重排/删除时整列
+                    // 逐条插值），列表长时滚动明显卡顿；内容随状态直接重排即可
                     ConversationRow(
                         item = item,
-                        modifier = Modifier.animateItem(),
                         onOpen = { onOpenChat(item.conversation.id) },
                         onRename = { renaming = item },
                         onDelete = { vm.deleteConversation(item.conversation) },
@@ -419,6 +420,7 @@ private fun NewConversationDialog(
 }
 
 /** 相对时间：刚刚 / N分钟前 / N小时前 / 昨天 / N天前 / 具体日期 */
+private val DateFmt = SimpleDateFormat("MM-dd", Locale.getDefault())
 private fun formatTime(ts: Long): String {
     val now = System.currentTimeMillis()
     val diff = now - ts
@@ -428,6 +430,6 @@ private fun formatTime(ts: Long): String {
         diff < 86_400_000 -> "${diff / 3_600_000}小时前"
         diff < 2 * 86_400_000 -> "昨天"
         diff < 7 * 86_400_000 -> "${diff / 86_400_000}天前"
-        else -> SimpleDateFormat("MM-dd", Locale.getDefault()).format(Date(ts))
+        else -> DateFmt.format(Date(ts))
     }
 }

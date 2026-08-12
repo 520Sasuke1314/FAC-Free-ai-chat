@@ -12,7 +12,10 @@ data class ChatRequest(
     val images: List<String> = emptyList(),
     /** 深度思考开关（DeepSeek/兼容代理）。null = 不发送（交给服务端默认）；
      * false = 显式关闭思考。Gson 序列化会省略 null，避免不认识的第三方接口报错 */
-    val thinking_enabled: Boolean? = null
+    val thinking_enabled: Boolean? = null,
+    /** 深度思考（新版协议）：DeepSeek 官方 API 的 {"type":"enabled"/"disabled"} 对象。
+     * Gson 对 JsonElement 字段原样序列化；null = 不发送 */
+    val thinking: com.google.gson.JsonObject? = null
 )
 
 data class Message(

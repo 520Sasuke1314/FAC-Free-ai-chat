@@ -156,6 +156,7 @@ private val ThinkingBlockRegex = Regex(
 private val ReferenceRegex = Regex("【reference:\\d+】|\\[reference:\\d+\\]")
 
 /** 消息时间显示：今天内只显。?时分秒，跨天则显。?年月日时分秒 */
+private val TimeFmt = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
 private fun formatMessageTime(timestamp: Long): String {
     val fmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault())
     return fmt.format(java.util.Date(timestamp))
@@ -1171,8 +1172,9 @@ val stripped = if (isWeb) raw.replace(ReferenceRegex, "").trim() else raw
                         color = MaterialTheme.colorScheme.outline
                     )
                 }
-                // 思考内容收纳篮：小箭头 + 小号浅色标题，点击展开/收起；深度思考开启时默认展开
-                if (showThinkingEnabled && !thinkingPart.isNullOrBlank()) {
+                // 思考内容收纳篮：小箭头 + 小号浅色标题，点击展开/收起；深度思考开启时默认展开。
+                // 深度思考开关关闭时整块隐藏（思考已禁用，不应展示历史思考内容）
+                if (showThinkingEnabled && deepThinking && !thinkingPart.isNullOrBlank()) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1260,7 +1262,8 @@ val stripped = if (isWeb) raw.replace(ReferenceRegex, "").trim() else raw
             if (!isWeb) {
                 Text(
                     text = if (isSameDay(message.timestamp, System.currentTimeMillis())) {
-                        java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date(message.timestamp))
+                        // 复用顶层缓存的时间格式化器，避免每条消息气泡在流式重组时反复 new SimpleDateFormat
+                        TimeFmt.format(java.util.Date(message.timestamp))
                     } else {
                         formatMessageTime(message.timestamp)
                     },
@@ -2112,7 +2115,8 @@ private fun ChatSettingsPage(
                 }
             }
             // 官网免费对话的思维链由服务端控制展示，本地开关无意义，隐。?
-            if (!isWeb) {
+            // 深度思考开关关闭时该行无意义（思考已禁用，也一并隐藏）
+            if (!isWeb && thinkingEnabled) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("展示思考内容", modifier = Modifier.weight(1f))
                     Switch(checked = showThinking, onCheckedChange = { showThinking = it })

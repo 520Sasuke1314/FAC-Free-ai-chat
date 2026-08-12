@@ -37,6 +37,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -48,6 +49,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -64,6 +66,10 @@ import com.yourapp.chat.ChatApplication
 import com.yourapp.chat.util.CrashLog
 import com.yourapp.chat.util.FileUtil
 import java.io.File
+import kotlinx.coroutines.delay
+
+/** 流式刷新频率档位（毫秒） */
+private val REFRESH_OPTIONS = listOf(50 to "50ms 流畅", 100 to "100ms 均衡", 200 to "200ms 省电", 500 to "500ms 极省电")
 
 /** 可选头像（emoji） */
 private val AVATAR_OPTIONS = listOf("🐳", "🐱", "🐶", "🦊", "🐼", "🦁", "🐸", "🐙", "🤖", "😀", "😎", "👽")
@@ -292,6 +298,7 @@ fun SettingsScreen(
             HorizontalDivider()
 
             // 消息流式输出
+            var refreshMs by remember { mutableStateOf(configRepo.getStreamRefreshMs()) }
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -321,6 +328,65 @@ fun SettingsScreen(
                             configRepo.setStreamingEnabled(it)
                         }
                     )
+                }
+                if (streamingEnabled) {
+                    HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                    Text(
+                        text = "刷新频率",
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    Text(
+                        text = "AI 回答流式输出时界面的刷新间隔，频率越高文字越平滑、CPU 占用越高",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp)
+                    ) {
+                        REFRESH_OPTIONS.forEach { (ms, label) ->
+                            FilterChip(
+                                selected = refreshMs == ms,
+                                onClick = {
+                                    refreshMs = ms
+                                    configRepo.setStreamRefreshMs(ms)
+                                },
+                                label = { Text(label) }
+                            )
+                        }
+                    }
+                }
+            }
+            // 流式刷新频率演示文章：切换频率时按新节奏重新逐字显示，直观对比刷新效果
+            if (streamingEnabled) {
+                val demoText = "欢迎体验流式输出演示。切换下方刷新频率后，本段文字会以新的节奏重新逐字显示：" +
+                    "频率越快（50ms），文字增长越平滑流畅；频率越慢（500ms），画面越\"一跳一跳\"但更省电。" +
+                    "实际对话中可按设备性能自由选择。"
+                var revealed by remember { mutableStateOf(0) }
+                LaunchedEffect(refreshMs) {
+                    revealed = 0
+                    while (revealed < demoText.length) {
+                        delay(refreshMs.toLong())
+                        revealed = (revealed + 2).coerceAtMost(demoText.length)
+                    }
+                }
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                ) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text("演示文章", style = MaterialTheme.typography.titleSmall)
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = demoText.take(revealed),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             }
             HorizontalDivider(Modifier.padding(vertical = 16.dp))

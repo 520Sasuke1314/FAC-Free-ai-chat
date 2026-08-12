@@ -21,6 +21,8 @@ data class WorldListUiState(
     val manualEntries: List<WorldEntryEntity> = emptyList(),
     /** 各集合下的条目，key = bookId */
     val entriesByBook: Map<Long, List<WorldEntryEntity>> = emptyMap(),
+    /** 已展开的集合 id（展开态挂在 VM：条目标被 LazyColumn 虚拟化回收后仍保持展开） */
+    val expandedBookIds: Set<Long> = emptySet(),
     /** 编辑中的集合 id（null = 手动条目） */
     val editingBookId: Long? = null,
     val editing: WorldEntryEntity? = null,
@@ -49,8 +51,9 @@ class WorldListViewModel(
         }
     }
 
-    /** 打开集合详情（加载其条目） */
+    /** 打开集合详情（加载其条目）；已加载过则跳过，避免重复收集 */
     fun openBook(bookId: Long) {
+        if (_uiState.value.entriesByBook.containsKey(bookId)) return
         viewModelScope.launch {
             repository.getEntriesByBook(bookId).collect { entries ->
                 _uiState.update { state ->
@@ -58,6 +61,15 @@ class WorldListViewModel(
                 }
             }
         }
+    }
+
+    /** 展开/收起集合：展开时确保其条目已加载 */
+    fun toggleBookExpanded(bookId: Long) {
+        val wantExpand = !_uiState.value.expandedBookIds.contains(bookId)
+        _uiState.update {
+            it.copy(expandedBookIds = if (wantExpand) it.expandedBookIds + bookId else it.expandedBookIds - bookId)
+        }
+        if (wantExpand) openBook(bookId)
     }
 
     fun openNew() {
