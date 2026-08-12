@@ -169,7 +169,8 @@ fun ConversationListScreen(
                         item = item,
                         modifier = Modifier.animateItem(
                             fadeInSpec = tween(0),
-                            fadeOutSpec = tween(0)
+                            fadeOutSpec = tween(0),
+                            placementSpec = tween(220)
                         ),
                         onOpen = { onOpenChat(item.conversation.id) },
                         onRename = { renaming = item },
@@ -286,11 +287,13 @@ private fun ConversationRow(
                 onClick = onOpen,
                 onLongClick = onRename
             )
-            // 会话卡片：圆角 + 浅色底（置顶态用主题色区分）
+            // 会话卡片：圆角 + 实色底（置顶态用主题色区分）。
+            // 注意用实色而非 copy(alpha)：列表行在半透明背景下每帧要做两层混合，
+            // 低端设备/软件渲染下多行同时滚动会明显掉帧；实色一行只有一次绘制。
             .clip(RoundedCornerShape(16.dp))
             .background(
-                if (isPinned) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
-                else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+                if (isPinned) MaterialTheme.colorScheme.primaryContainer
+                else MaterialTheme.colorScheme.surfaceContainerHigh
             )
             .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically

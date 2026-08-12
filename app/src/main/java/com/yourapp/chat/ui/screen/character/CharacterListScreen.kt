@@ -314,7 +314,7 @@ private fun CharacterCardRow(
             .clickable(onClick = onClick)
             // 圆角卡片（与对话列表一致的圆润 UI）
             .clip(RoundedCornerShape(16.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
             .padding(12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {

@@ -32,6 +32,8 @@ import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.FileDownload
+import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.automirrored.filled.ArrowRight
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -53,6 +55,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -64,9 +67,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.yourapp.chat.ChatApplication
 import com.yourapp.chat.util.CrashLog
+import com.yourapp.chat.util.DataBackup
 import com.yourapp.chat.util.FileUtil
 import java.io.File
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /** 可选头像（emoji） */
 private val AVATAR_OPTIONS = listOf("🐳", "🐱", "🐶", "🦊", "🐼", "🦁", "🐸", "🐙", "🤖", "😀", "😎", "👽")
@@ -86,6 +91,10 @@ fun SettingsScreen(
     var avatar by remember { mutableStateOf(configRepo.getAvatar()) }
     var persona by remember { mutableStateOf(configRepo.getPersona()) }
     var showAbout by remember { mutableStateOf(false) }
+    var showExportConfirm by remember { mutableStateOf(false) }
+    var showImportConfirm by remember { mutableStateOf(false) }
+    var backupResult by remember { mutableStateOf<Pair<String, Boolean>?>(null) }
+    val scope = rememberCoroutineScope()
 
     // 相册选图 → 复制到应用私有目录，路径存为头像
     val avatarLauncher = rememberLauncherForActivityResult(
@@ -96,6 +105,30 @@ fun SettingsScreen(
             FileUtil.copyUriToFile(context, it, dest)?.let { saved ->
                 avatar = saved.absolutePath
                 configRepo.setAvatar(saved.absolutePath)
+            }
+        }
+    }
+
+    // 导出全部数据 → zip（CreateDocument 选保存位置）
+    val exportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/zip")
+    ) { uri ->
+        if (uri != null) {
+            scope.launch {
+                backupResult = runCatching { DataBackup.export(context, uri) }
+                    .fold({ Pair(it, false) }, { Pair("导出失败：${it.message}", false) })
+            }
+        }
+    }
+
+    // 导入备份 zip → 覆盖恢复（完成后自动重启）
+    val importLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri ->
+        if (uri != null) {
+            scope.launch {
+                backupResult = runCatching { DataBackup.import(context, uri) }
+                    .fold({ Pair(it, true) }, { Pair("导入失败：${it.message}", true) })
             }
         }
     }
@@ -401,6 +434,70 @@ fun SettingsScreen(
             }
             HorizontalDivider(Modifier.padding(vertical = 16.dp))
 
+            // 数据管理：导出 / 导入全部数据（zip）
+            Text(
+                text = "数据管理",
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.primary
+            )
+            Spacer(Modifier.height(8.dp))
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+                shape = RoundedCornerShape(16.dp),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { showExportConfirm = true }
+                        .padding(vertical = 12.dp, horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Filled.FileDownload, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("导出全部数据", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            "对话 / 消息 / API 配置 / 角色卡 / 世界书 / 技能 / 设置，打包为 zip",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                    }
+                    Icon(
+                        Icons.AutoMirrored.Filled.ArrowRight,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.outline
+                    )
+                }
+                HorizontalDivider(Modifier.padding(horizontal = 16.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { showImportConfirm = true }
+                        .padding(vertical = 12.dp, horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Filled.FileUpload, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("导入备份", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            "从 zip 恢复全部数据（覆盖当前内容，旧数据自动留存为 *.bak_import）",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
+                    }
+                    Icon(
+                        Icons.AutoMirrored.Filled.ArrowRight,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.outline
+                    )
+                }
+            }
+            HorizontalDivider(Modifier.padding(vertical = 16.dp))
+
             // 关于软件（页面最底部）
             Card(
                 modifier = Modifier
@@ -433,6 +530,71 @@ fun SettingsScreen(
         AboutDialog(
             context = context,
             onDismiss = { showAbout = false }
+        )
+    }
+
+    if (showExportConfirm) {
+        AlertDialog(
+            onDismissRequest = { showExportConfirm = false },
+            title = { Text("导出全部数据") },
+            text = {
+                Text("将导出对话、消息、API 配置、角色卡、世界书、技能、设置与崩溃日志。\n\n" +
+                        "注意：备份包含 API 密钥与在线登录信息，请妥善保管。")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showExportConfirm = false
+                    val stamp = java.text.SimpleDateFormat(
+                        "yyyyMMdd_HHmm",
+                        java.util.Locale.getDefault()
+                    ).format(java.util.Date())
+                    exportLauncher.launch("ChatApp备份_$stamp.zip")
+                }) { Text("选择位置并导出") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showExportConfirm = false }) { Text("取消") }
+            }
+        )
+    }
+
+    if (showImportConfirm) {
+        AlertDialog(
+            onDismissRequest = { showImportConfirm = false },
+            title = { Text("导入备份") },
+            text = {
+                Text("将从 zip 恢复全部数据，覆盖当前内容（现有数据会先自动备份为 *.bak_import 留存）。\n\n" +
+                        "导入完成后应用会自动重启。")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showImportConfirm = false
+                    importLauncher.launch("*/*")
+                }) { Text("选择备份文件") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showImportConfirm = false }) { Text("取消") }
+            }
+        )
+    }
+
+    backupResult?.let { (msg, isImport) ->
+        AlertDialog(
+            onDismissRequest = { backupResult = null },
+            title = { Text(if (isImport) "导入完成" else "导出完成") },
+            text = { Text(msg) },
+            confirmButton = {
+                TextButton(onClick = { backupResult = null }) {
+                    Text(if (isImport) "稍后重启" else "确定")
+                }
+            },
+            dismissButton = {
+                if (isImport) {
+                    TextButton(onClick = {
+                        backupResult = null
+                        DataBackup.restartApp(context)
+                    }) { Text("立即重启") }
+                }
+            }
         )
     }
 }

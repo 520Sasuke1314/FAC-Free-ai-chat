@@ -54,7 +54,7 @@ fun NavGraph() {
 
     Crossfade(
         targetState = current,
-        animationSpec = tween(200),
+        animationSpec = tween(260),
         label = "pageCrossfade"
     ) { screen ->
         when (screen) {

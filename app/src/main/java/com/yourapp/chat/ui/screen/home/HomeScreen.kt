@@ -1,5 +1,7 @@
 package com.yourapp.chat.ui.screen.home
 
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -14,7 +16,10 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import com.yourapp.chat.ui.screen.conversationlist.ConversationListScreen
@@ -52,14 +57,18 @@ fun HomeScreen(
             }
         }
     ) { padding ->
-        // 注意：不对内容套 graphicsLayer/alpha 淡入淡出层。整页内容一旦套上
-        // RenderNode 透明层，低端设备/软件渲染下列表每帧都要做一次离屏合成，
-        // 表现为「除对话页外所有 Tab 页滚动都卡」（对话页不在本容器内、一直流畅）。
-        // 换 Tab 改为直接切换即可。
+        // 换 Tab 时播放一次短淡入：动画结束即 alpha=1，不留常驻透明层，
+        // 避免此前整页常驻 graphicsLayer 透明层导致的「除对话页外滚动卡顿」。
+        val fadeIn = remember { Animatable(1f) }
+        LaunchedEffect(tab) {
+            if (fadeIn.value == 1f) fadeIn.snapTo(0f)
+            fadeIn.animateTo(1f, tween(220))
+        }
         Box(
             Modifier
                 .fillMaxSize()
                 .padding(padding)
+                .graphicsLayer { alpha = fadeIn.value }
         ) {
             when (tab) {
                 HomeTab.Conversations -> ConversationListScreen(
