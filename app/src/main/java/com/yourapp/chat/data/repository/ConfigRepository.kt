@@ -36,13 +36,6 @@ class ConfigRepository(
         prefs.edit().putString("nickname", nickname).apply()
     }
 
-    /** 深色模式（独立开关，不跟随系统；默认浅色） */
-    fun getDarkMode(): Boolean = prefs.getBoolean("dark_mode", false)
-
-    fun setDarkMode(enabled: Boolean) {
-        prefs.edit().putBoolean("dark_mode", enabled).apply()
-    }
-
     /** 用户头像（emoji，如 🐳 / 😀；空 = 默认） */
     fun getAvatar(): String = prefs.getString("avatar", "🐳").orEmpty()
 

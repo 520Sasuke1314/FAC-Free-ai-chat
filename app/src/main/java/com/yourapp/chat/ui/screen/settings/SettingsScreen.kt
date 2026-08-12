@@ -74,7 +74,6 @@ fun SettingsScreen(
     val configRepo = remember { ChatApplication.instance.configRepository }
     var streamingEnabled by remember { mutableStateOf(configRepo.isStreamingEnabled()) }
     var nickname by remember { mutableStateOf(configRepo.getNickname()) }
-    var darkMode by remember { mutableStateOf(configRepo.getDarkMode()) }
     var persona by remember { mutableStateOf(configRepo.getPersona()) }
     var showAbout by remember { mutableStateOf(false) }
     var showExportConfirm by remember { mutableStateOf(false) }
@@ -251,32 +250,10 @@ fun SettingsScreen(
                     )
                 }
                 if (streamingEnabled) {
-// 深色模式：独立开关（不跟随系统），切换时全局颜色由浅到深/由深到浅平滑过渡
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 10.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("深色模式", style = MaterialTheme.typography.titleSmall)
-                    Text(
-                        "独立于系统设置，切换时颜色平滑过渡",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.outline
-                    )
-                }
-                Switch(
-                    checked = darkMode,
-                    onCheckedChange = {
-                        darkMode = it
-                        ChatApplication.instance.setDarkMode(it)
-                    }
-                )
-            }
-            HorizontalDivider(Modifier.padding(vertical = 8.dp))
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(Modifier.weight(1f)) {
@@ -306,12 +283,14 @@ fun SettingsScreen(
                             configRepo.setStreamRefreshMs(refreshMs)
                         },
                         valueRange = 1f..500f,
-                        steps = 498
+                        steps = 498,
+                        modifier = Modifier.padding(horizontal = 12.dp)
                     )
                     Text(
                         text = "1ms（最快，高 CPU） · 500ms（最省电）",
                         style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.outline
+                        color = MaterialTheme.colorScheme.outline,
+                        modifier = Modifier.padding(horizontal = 16.dp)
                     )
                 }
             }

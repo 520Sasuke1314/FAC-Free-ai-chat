@@ -73,16 +73,6 @@ class ChatApplication : Application() {
         SkillRepository(database.skillDao(), okHttpClient)
     }
 
-    /** 深色模式开关（Compose 可读状态，设置页切换后全局主题随之响应） */
-    val darkModeEnabled: androidx.compose.runtime.MutableState<Boolean> by lazy {
-        androidx.compose.runtime.mutableStateOf(configRepository.getDarkMode())
-    }
-
-    fun setDarkMode(enabled: Boolean) {
-        configRepository.setDarkMode(enabled)
-        darkModeEnabled.value = enabled
-    }
-
     override fun onCreate() {
         super.onCreate()
         INSTANCE = this

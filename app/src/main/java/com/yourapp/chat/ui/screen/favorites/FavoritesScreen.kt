@@ -26,7 +26,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
@@ -97,6 +97,17 @@ fun FavoritesScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val context = LocalContext.current
     var menuOpen by remember { mutableStateOf(false) }
+
+    // 置顶/取消置顶飞行动画优化：只对「落点在视口内/附近」的行做位置飞行动画。
+    // 落点远离视口时即时重排，避免行在半空带着巨量偏移、滑到边缘"卡一下再归位"。
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+    var flyId by remember { mutableStateOf<Long?>(null) }
+    val viewportStart by remember(listState) {
+        androidx.compose.runtime.derivedStateOf { listState.firstVisibleItemIndex }
+    }
+    val viewportSpan by remember(listState) {
+        androidx.compose.runtime.derivedStateOf { (listState.layoutInfo.visibleItemsInfo.size).coerceAtLeast(8) }
+    }
 
     LaunchedEffect(state.info) {
         val msg = state.info ?: return@LaunchedEffect
@@ -183,16 +194,25 @@ fun FavoritesScreen(
         } else {
             LazyColumn(
                 modifier = Modifier.fillMaxSize().padding(padding),
+                state = listState,
                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(state.items, key = { it.message.id }, contentType = { "favorite" }) { item ->
+                itemsIndexed(
+                    state.items,
+                    key = { _, it -> it.message.id },
+                    contentType = { _, _ -> "favorite" }
+                ) { index, item ->
+                    // 仅该行是本次置顶/取消置顶的对象且落点在视口范围内时才放位置飞行动画；
+                    // 落点远离视口时即时重排（视口外不可见，避免半空挣扎、滑到顶部"卡一下"）。
+                    val fly = item.message.id == flyId &&
+                        index in viewportStart..(viewportStart + viewportSpan)
                     FavoriteRow(
                         item = item,
                         modifier = Modifier.animateItem(
                             fadeInSpec = tween(0),
                             fadeOutSpec = tween(0),
-                            placementSpec = tween(220)
+                            placementSpec = if (fly) tween(220) else tween(0)
                         ),
                         selectionMode = state.isSelectionMode,
                         selected = state.selectedIds.contains(item.message.id),
@@ -204,7 +224,12 @@ fun FavoritesScreen(
                             if (!state.isSelectionMode) vm.setSelectionMode(true)
                             vm.toggleSelect(item.message.id)
                         },
-                        onSwipeRight = { if (!state.isSelectionMode) vm.togglePinFavorite(item.message.id, !item.message.pinned) }
+                        onSwipeRight = {
+                            if (!state.isSelectionMode) {
+                                flyId = item.message.id
+                                vm.togglePinFavorite(item.message.id, !item.message.pinned)
+                            }
+                        }
                     )
                 }
             }
