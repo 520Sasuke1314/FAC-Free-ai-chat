@@ -18,8 +18,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -41,7 +40,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -77,18 +75,6 @@ fun ConversationListScreen(
     var searching by remember { mutableStateOf(false) }
     var searchText by remember { mutableStateOf("") }
     var renaming by remember { mutableStateOf<ConversationWithLast?>(null) }
-
-    // 置顶/取消置顶飞行动画优化：只对「落点在视口内/附近」的行做位置飞行动画。
-    // 落点远离视口（置顶时落点=0，但用户滚在很深的位置）时即时重排，
-    // 避免行在半空带着巨量偏移、滑到边缘"卡一下再归位"。
-    val listState = rememberLazyListState()
-    var flyId by remember { mutableStateOf<Long?>(null) }
-    val viewportStart by remember(listState) {
-        derivedStateOf { listState.firstVisibleItemIndex }
-    }
-    val viewportSpan by remember(listState) {
-        derivedStateOf { (listState.layoutInfo.visibleItemsInfo.size).coerceAtLeast(8) }
-    }
 
     // 当前 API 摘要：通道 + 模型 + 脱敏 key，点击进 API 配置页
     val currentProfile = state.apiProfiles.firstOrNull { it.id == state.selectedProfileId }
@@ -169,39 +155,26 @@ fun ConversationListScreen(
             }
         } else {
             // LazyColumn + animateItem：置顶/取消置顶行飞行动画（往上飞到顶部/往下飞回原位）
-            // 淡入淡出关闭（tween(0)），只保留位置飞行；落点远离视口时即时重排（见上方 fly 判定）
+            // 淡入淡出关闭（tween(0)），只保留位置飞行
             LazyColumn(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding),
-                state = listState,
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                itemsIndexed(
-                    state.conversations,
-                    key = { _, c -> c.conversation.id },
-                    contentType = { _, _ -> "conversation" }
-                ) { index, item ->
-                    // 仅当该行是本次置顶/取消置顶的对象，且其落点在视口范围内时才放位置飞行动画；
-                    // 否则 tween(0) → 即时落到目标位（视口外不可见，看起来就是"已置顶好了"），
-                    // 杜绝带巨量偏移半空挣扎、滑到顶部"卡一下"。
-                    val fly = item.conversation.id == flyId &&
-                        index in viewportStart..(viewportStart + viewportSpan)
+                items(state.conversations, key = { it.conversation.id }, contentType = { "conversation" }) { item ->
                     ConversationRow(
                         item = item,
                         modifier = Modifier.animateItem(
                             fadeInSpec = tween(0),
                             fadeOutSpec = tween(0),
-                            placementSpec = if (fly) tween(220) else tween(0)
+                            placementSpec = tween(220)
                         ),
                         onOpen = { onOpenChat(item.conversation.id) },
                         onRename = { renaming = item },
                         onDelete = { vm.deleteConversation(item.conversation) },
-                        onSwipeRight = {
-                            flyId = item.conversation.id
-                            vm.togglePin(item.conversation)
-                        }
+                        onSwipeRight = { vm.togglePin(item.conversation) }
                     )
                 }
             }
