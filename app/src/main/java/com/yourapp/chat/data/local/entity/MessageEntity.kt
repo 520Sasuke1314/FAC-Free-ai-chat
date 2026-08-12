@@ -30,5 +30,7 @@ data class MessageEntity(
     val isFavorite: Boolean = false,
     /** 收藏列表内是否置顶（右滑切换，排序置顶优先） */
     @ColumnInfo(defaultValue = "0")
-    val pinned: Boolean = false
+    val pinned: Boolean = false,
+    /** 附件元数据 JSON（用户消息展示缩略图/文件 chip 用）：[{"name","mime","isImage","dataUrl"?}] */
+    val attachmentsJson: String? = null
 )

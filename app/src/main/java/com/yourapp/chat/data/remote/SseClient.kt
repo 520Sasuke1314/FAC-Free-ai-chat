@@ -85,7 +85,6 @@ class SseClient(private val okHttpClient: OkHttpClient) {
             .addHeader("Content-Type", "application/json")
             .post(reqBody)
             .build()
-        logDiag("请求 URL=$fullUrl 模型=${request.model}")
 
         var response = withContext(Dispatchers.IO) {
             streamingClient.newCall(httpRequest).execute()
@@ -102,15 +101,12 @@ class SseClient(private val okHttpClient: OkHttpClient) {
                 .addHeader("Content-Type", "application/json")
                 .post(reqBody)
                 .build()
-            logDiag("接口不识别 thinking 字段（${response.code}），已回退重试")
             response = withContext(Dispatchers.IO) {
                 streamingClient.newCall(httpRequest).execute()
             }
         }
-        logDiag("响应码=${response.code} ${response.message}")
         if (!response.isSuccessful) {
             val errBody = response.body?.string().orEmpty()
-            logDiag("非 2xx 响应体=$errBody")
             throw IOException("API error: ${response.code} ${response.message} $errBody")
         }
         val source = response.body?.source() ?: throw IOException("Empty body")
@@ -149,7 +145,6 @@ class SseClient(private val okHttpClient: OkHttpClient) {
                         if (trimmed.startsWith("data:")) {
                             val data = trimmed.removePrefix("data:").trim()
                             if (data == "[DONE]") {
-                                logDiag("收到 [DONE]")
                                 break
                             }
                             // 解析与 emit 分离：只有 fromJson 在 try-catch 内，
@@ -157,7 +152,6 @@ class SseClient(private val okHttpClient: OkHttpClient) {
                             val chunk = try {
                                 gson.fromJson(data, ChatResponse::class.java)
                             } catch (e: Exception) {
-                                logDiag("单行解析失败: ${e.javaClass.simpleName}: ${e.message} | $data")
                                 null
                             }
                             chunk?.choices?.firstOrNull()?.let { choice ->
@@ -188,14 +182,13 @@ class SseClient(private val okHttpClient: OkHttpClient) {
                             }
                         }
                         // 性能优化：每50行记录一次日志，减少日志频率
-                        if (lineCount % 50 == 0) logDiag("已读 ${lineCount} 行, emit ${emittedCount} 次")
+                        if (lineCount % 50 == 0) { }
                         // 无正文保护：思考中（有 reasoning）给 120s，否则 25s。
                         // 达到时限仍无正文 → 中断并抛错，避免界面永远显示省略号。
                         if (!bodyEmitted) {
                             val limit = if (reasoning.isNotEmpty()) 120_000L else 25_000L
                             if (System.currentTimeMillis() - startedAt > limit) {
                                 val snippet = rawBody.toString().trim().take(800)
-                                logDiag("无正文超时, 已读 ${lineCount} 行, 原始: $snippet")
                                 throw IOException(
                                     "接口在 ${limit / 1000} 秒内未返回任何正文" +
                                         (if (snippet.isNotEmpty()) "。接口原始返回：\n$snippet" else "（接口未返回任何数据）")
@@ -203,9 +196,7 @@ class SseClient(private val okHttpClient: OkHttpClient) {
                             }
                         }
                     }
-                    logDiag("循环结束, 共读 ${lineCount} 行, emit ${emittedCount} 次")
                 } catch (e: java.net.SocketTimeoutException) {
-                    logDiag("SocketTimeout: ${e.message}")
                     throw IOException(
                         "接口响应超时（60 秒内未收到任何数据）。请检查网络，或该接口是否支持流式输出、模型名是否正确。"
                     )
@@ -278,15 +269,6 @@ class SseClient(private val okHttpClient: OkHttpClient) {
             err?.optString("message")?.takeIf { it.isNotBlank() }
         } catch (e: Exception) {
             null
-        }
-    }
-
-    /** 流式诊断日志：写入崩溃日志文件，供「关于软件 → 崩溃日志」导出排查 */
-    private fun logDiag(text: String) {
-        try {
-            val app = com.yourapp.chat.ChatApplication.instance
-            com.yourapp.chat.util.CrashLog.append(app, "[SseClient] $text")
-        } catch (_: Exception) {
         }
     }
 }

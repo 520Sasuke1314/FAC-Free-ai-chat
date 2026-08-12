@@ -191,12 +191,13 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         searchEnabled: Boolean = false,
         searchProvider: String? = null,
         imageDataUrls: List<String> = emptyList(),
-        visionContext: String? = null
+        visionContext: String? = null,
+        attachmentText: String? = null,
+        attachmentsJson: String? = null
     ) {
         val cfg = profile ?: apiProfileRepo?.getDefault()
             ?: configRepo.getConfig()?.let { ApiProfileEntity(provider = "custom", name = "旧配置", baseUrl = it.baseUrl, apiKey = it.apiKey, model = it.model) }
             ?: throw IllegalStateException("请先配置 API")
-        logDiag("sendMessageStream: provider=${cfg.provider} model=${cfg.model} baseUrl=${cfg.baseUrl} 思考=${thinkingEnabled} 流式=${configRepo.isStreamingEnabled()}")
         // 记录该对话使用过非官网 API（之后切换官网免费会丢记忆，届时禁用官网选项）
         if (cfg.provider != "deepseek_web") configRepo.markConversationUsedApi(conversationId)
         val history = db.messageDao().getAllMessagesForConversation(conversationId)
@@ -204,13 +205,14 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
             .sortedBy { it.timestamp }
         val last = history.lastOrNull()
 
-        // 插入 user 消息
+        // 插入 user 消息（附件元数据一并存储，气泡内展示缩略图/文件 chip）
         val userMsgId = db.messageDao().insert(
             MessageEntity(
                 conversationId = conversationId,
                 role = "user",
                 content = userContent,
-                parentMessageId = last?.id
+                parentMessageId = last?.id,
+                attachmentsJson = attachmentsJson
             )
         )
 
@@ -242,7 +244,7 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
             card?.let { onInjectionNotice("已注入角色卡：${it.name}") }
         }
         
-        val finalMessages = if (matchedWorld.isNotEmpty() || persona.isNotEmpty() || !visionContext.isNullOrBlank()) {
+        val finalMessages = if (matchedWorld.isNotEmpty() || persona.isNotEmpty() || !visionContext.isNullOrBlank() || !attachmentText.isNullOrBlank()) {
             val worldBlock = matchedWorld.joinToString("\n\n").take(6000)
             val personaBlock = if (persona.isNotEmpty()) {
                 "【用户设定】这是与你对话的用户的自定义设定，请始终遵守：\n$persona"
@@ -250,10 +252,14 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
             val visionBlock = if (!visionContext.isNullOrBlank()) {
                 "以下是用户本次所附图片的内容描述，请结合图片内容回答问题：\n$visionContext"
             } else ""
+            val attachmentBlock = if (!attachmentText.isNullOrBlank()) {
+                "以下是用户本次上传的文件内容，请结合内容回答（与当前对话无关时可忽略）：\n$attachmentText"
+            } else ""
             val block = listOfNotNull(
                 worldBlock.takeIf { it.isNotEmpty() }?.let { "以下是当前场景的世界信息，请融入对话：\n$it" },
                 personaBlock.takeIf { it.isNotEmpty() },
-                visionBlock.takeIf { it.isNotEmpty() }
+                visionBlock.takeIf { it.isNotEmpty() },
+                attachmentBlock.takeIf { it.isNotEmpty() }
             ).joinToString("\n\n")
             requestMessages + Message(role = "system", content = block)
         } else requestMessages
@@ -274,17 +280,18 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
             if (cfg.provider == "deepseek_web") {
                 val webRepo = deepSeekWebRepo ?: throw IllegalStateException("官网通道未初始化")
                 if (!webRepo.hasToken()) throw IllegalStateException("未登录 DeepSeek 官网账号")
-                // 官网 completion 的 prompt 是单条消息：把角色卡设定 + 命中的世界书信息作为前缀注入，
+                // 官网 completion 的 prompt 是单条消息：把角色卡设定 + 命中的世界书信息 + 附件内容作为前缀注入，
                 // 让模型在回答前先读到角色与场景设定（这是角色卡/世界书生效的关键）。
                 streamWebReply(
                     conversationId = conversationId,
-                    prompt = buildWebPrompt(conversation, userContent, matchedWorld),
+                    prompt = buildWebPrompt(conversation, userContent, matchedWorld, attachmentText),
                     assistantId = assistantId,
                     assistantParentId = userMsgId,
                     parentOverride = null,
                     thinkingEnabled = thinkingEnabled,
                     searchEnabled = searchEnabled,
                     searchProvider = searchProvider,
+                    images = imageDataUrls,
                     sb = sb,
                     onToken = onToken,
                     onContent = onContent,
@@ -333,13 +340,14 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
     }
 
     /**
-     * 官网 completion 的单条 prompt：角色卡设定 + 世界信息 + 用户正文。
-     * 让模型在回答前先读到角色与场景设定。
+     * 官网 completion 的单条 prompt：角色卡设定 + 世界信息 + 附件内容 + 用户正文。
+     * 让模型在回答前先读到角色与场景设定、本次上传的文件内容。
      */
     private suspend fun buildWebPrompt(
         conversation: ConversationEntity?,
         userContent: String,
-        matchedWorld: List<String>
+        matchedWorld: List<String>,
+        attachmentText: String? = null
     ): String {
         val card = conversation?.characterCardId?.let { db.characterCardDao().getById(it) }
         val worldPrefix = matchedWorld.joinToString("\n\n").take(6000)
@@ -356,6 +364,10 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
             }
             if (persona.isNotEmpty()) {
                 append("【用户设定】这是与你对话的用户的自定义设定，请始终遵守：\n$persona\n\n")
+            }
+            val attachText = attachmentText?.trim()
+            if (!attachText.isNullOrEmpty()) {
+                append("【上传文件内容】用户本次上传了以下文件，请结合内容回答（与当前对话无关时可忽略）：\n$attachText\n\n")
             }
             append(userContent)
         }
@@ -374,6 +386,7 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         thinkingEnabled: Boolean,
         searchEnabled: Boolean,
         searchProvider: String?,
+        images: List<String> = emptyList(),
         sb: StringBuilder,
         onToken: (String) -> Unit,
         onContent: (String) -> Unit,
@@ -417,6 +430,7 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                     searchEnabled = searchEnabled,
                     searchProvider = searchProvider,
                     parentMessageIdOverride = parentOverride,
+                    imageDataUrls = images,
                     onThinking = { t ->
                         thinkingText.append(t)
                         // 思考链按刷新频率节流推送（思考逐段增长，UI 单独展示）
@@ -1131,15 +1145,6 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                 aiGreeting = aiGreeting
             )
         )
-    }
-
-    /** 诊断日志：写入崩溃日志文件，供「关于软件 → 崩溃日志」导出排查 */
-    private fun logDiag(text: String) {
-        try {
-            val app = com.yourapp.chat.ChatApplication.instance
-            com.yourapp.chat.util.CrashLog.append(app, "[ChatRepository] $text")
-        } catch (_: Exception) {
-        }
     }
 
     /**

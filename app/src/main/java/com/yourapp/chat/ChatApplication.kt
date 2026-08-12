@@ -78,9 +78,15 @@ class ChatApplication : Application() {
         INSTANCE = this
         // 全局崩溃日志捕获：闪退时把堆栈写入文件，便于定位。
         // 必须保存并调用【旧的】默认处理器，否则会无限递归导致进程卡死（黑屏）。
+        // 注意只记录真正的闪退：正常退出/协程取消/网络收尾抛出的 CancellationException、
+        // InterruptedException、IOException 属正常抖动（如后台断流、进程被系统回收），
+        // 误记会让「崩溃日志」在没闪退时也有内容。
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            CrashLog.log(this, throwable)
+            val benign = throwable is java.util.concurrent.CancellationException ||
+                throwable is InterruptedException ||
+                throwable is java.io.IOException
+            if (!benign) CrashLog.log(this, throwable)
             if (defaultHandler != null) {
                 defaultHandler.uncaughtException(thread, throwable)
             } else {

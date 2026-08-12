@@ -112,6 +112,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -710,9 +716,15 @@ var followStream by remember { mutableStateOf(true) }
                             Icon(Icons.Filled.Close, contentDescription = "中止生成")
                         }
                     } else {
-                        // 附件按钮：添加图片 / 文本 / JSON
+                        // 附件按钮：添加图片 / 文本 / JSON（官网免费通道不支持图片附件，仅文本/JSON）
                         IconButton(onClick = {
-                            attachLauncher.launch(arrayOf("image/*", "text/plain", "application/json", "text/json", "text/markdown"))
+                            attachLauncher.launch(
+                                if (isWeb) {
+                                    arrayOf("text/plain", "application/json", "text/json", "text/markdown")
+                                } else {
+                                    arrayOf("image/*", "text/plain", "application/json", "text/json", "text/markdown")
+                                }
+                            )
                         }) {
                             Icon(Icons.Filled.Add, contentDescription = "添加附件")
                         }
@@ -730,7 +742,13 @@ var followStream by remember { mutableStateOf(true) }
         // 反序列表：reverseLayout 让最新消息固定在底部，索。?0 = 最新，
         // 自动滚动跟随底部时始终看到思考链/正文的最新进度。?
 val reversedMessages = remember(state.messages) { state.messages.asReversed() }
-        val generatingMsgId = if (state.isSending) state.messages.lastOrNull()?.id else null
+        // 生成中的消息 = 列表最后一条且内容仍为空占位的 assistant 消息。
+        // 不能只看"最后一条"：发送图片需先调识图模型（耗时期间列表末尾还是上一条 AI 回复），
+        // 若把它当成生成中消息，会显示成"…/思考中…"（上一条回复暂时消失，直到占位消息插入）。
+        val generatingMsgId = if (state.isSending) {
+            state.messages.lastOrNull()
+                ?.takeIf { it.role == "assistant" && it.content.isEmpty() }?.id
+        } else null
         
         // 使用 derivedStateOf 避免每帧重新计算流式内容解析
         val streamingThinkingContent = remember(state) {
@@ -884,10 +902,10 @@ val reversedMessages = remember(state.messages) { state.messages.asReversed() }
         )
     }
     
-    // 分支选择器（回溯用）
+    // 分支选择器（回溯用）：包含用户与 AI 消息
     if (state.showBranchPicker) {
         BranchPickerDialog(
-            messages = state.messages.filter { it.role == "user" },
+            messages = state.messages,
             selectedId = state.branchSelectedMessageId,
             onSelect = { id -> vm.branchAt(id); vm.toggleBranchPicker() },
             onDismiss = { vm.toggleBranchPicker() }
@@ -938,7 +956,7 @@ private fun EditMessageDialog(
 }
 
 /**
- * 分支选择器（回溯用）：只显示用户消息，默认选中最后一条，并把选中消息自动滚到顶部
+ * 分支选择器（回溯用）：显示用户与 AI 消息，默认选中最后一条，并把选中消息自动滚到顶部
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -958,10 +976,10 @@ private fun BranchPickerDialog(
     }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("选择回溯位置（仅用户消息）") },
+        title = { Text("选择回溯位置（用户 / AI 消息）") },
         text = {
             if (messages.isEmpty()) {
-                Text("暂无用户消息")
+                Text("暂无消息")
             } else {
                 LazyColumn(
                     state = listState,
@@ -983,10 +1001,12 @@ private fun BranchPickerDialog(
                             }
                             Column(Modifier.weight(1f)) {
                                 Text(
-                                    text = contentPreview,
+                                    text = if (msg.role == "user") "用户：$contentPreview" else "AI：$contentPreview",
                                     style = MaterialTheme.typography.bodyMedium,
                                     maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis
+                                    overflow = TextOverflow.Ellipsis,
+                                    color = if (msg.role == "user") MaterialTheme.colorScheme.onSurface
+                                    else MaterialTheme.colorScheme.primary
                                 )
                                 Text(
                                     text = formatMessageTime(msg.timestamp),
@@ -1257,6 +1277,50 @@ val stripped = if (isWeb) raw.replace(ReferenceRegex, "").trim() else raw
                         textAlign = if (isUser) TextAlign.End else TextAlign.Start,
                     )
                 }
+                // 用户消息附件：图片缩略图 / 文件 chip（元数据存于 message.attachmentsJson）
+                val attachments = remember(message.attachmentsJson, isUser) {
+                    if (!isUser || message.attachmentsJson.isNullOrBlank()) emptyList()
+                    else runCatching {
+                        val arr = org.json.JSONArray(message.attachmentsJson)
+                        (0 until arr.length()).map { i ->
+                            val o = arr.getJSONObject(i)
+                            AttachMeta(
+                                name = o.optString("name"),
+                                mime = o.optString("mime"),
+                                isImage = o.optBoolean("isImage"),
+                                dataUrl = o.optString("dataUrl")
+                            )
+                        }
+                    }.getOrDefault(emptyList())
+                }
+                if (attachments.isNotEmpty()) {
+                    Spacer(Modifier.height(8.dp))
+                    Column(
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                        horizontalAlignment = if (isUser) Alignment.End else Alignment.Start
+                    ) {
+                        attachments.forEach { a ->
+                            if (a.isImage && a.dataUrl.isNotBlank()) {
+                                val bmp = remember(a.dataUrl) { decodeSampledImage(a.dataUrl, 1024) }
+                                if (bmp != null) {
+                                    Image(
+                                        bitmap = bmp.asImageBitmap(),
+                                        contentDescription = a.name,
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .widthIn(max = 220.dp)
+                                            .heightIn(max = 220.dp),
+                                        contentScale = ContentScale.Fit
+                                    )
+                                } else {
+                                    AttachChip(a)
+                                }
+                            } else {
+                                AttachChip(a)
+                            }
+                        }
+                    }
+                }
                 // 用户消息：识图描述仅注入聊天模型上下文，不在界面显示（rikkahub OCR 思路）
             }
         }
@@ -1325,6 +1389,12 @@ val stripped = if (isWeb) raw.replace(ReferenceRegex, "").trim() else raw
                     onClick = { vm.regenerate(message.id) }
                 )
                 if (!isWeb) {
+                    // AI 消息同样支持回溯（分支选择器已包含 AI 消息）
+                    MessageAction(
+                        icon = Icons.Filled.CallSplit,
+                        label = "回溯",
+                        onClick = { vm.toggleBranchPicker() }
+                    )
                     MessageAction(
                         icon = Icons.Filled.Edit,
                         label = "编辑",
@@ -2319,6 +2389,65 @@ private fun AnimatedDots(text: String, paddingTop: Int = 0) {
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.outline
         )
+    }
+}
+
+/**
+ * 用户消息附件元数据（存于 Message.attachmentsJson）
+ */
+private data class AttachMeta(
+    val name: String,
+    val mime: String,
+    val isImage: Boolean,
+    val dataUrl: String = ""
+)
+
+/**
+ * 文件附件 chip：显示文件名 + 类型图标（图片解码失败时也退化为 chip）
+ */
+@Composable
+private fun AttachChip(meta: AttachMeta) {
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = when {
+                meta.mime.startsWith("image/") -> Icons.Filled.Image
+                meta.name.endsWith(".json", true) -> Icons.Filled.Description
+                else -> Icons.Filled.AttachFile
+            },
+            contentDescription = null,
+            modifier = Modifier.size(14.dp),
+            tint = MaterialTheme.colorScheme.primary
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = meta.name,
+            style = MaterialTheme.typography.labelMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+/**
+ * 将 dataUrl 图片按最长边 maxPx 采样解码为 Bitmap（避免大图直接解码 OOM）
+ */
+private fun decodeSampledImage(dataUrl: String, maxPx: Int): android.graphics.Bitmap? {
+    return try {
+        val bytes = android.util.Base64.decode(dataUrl.substringAfter(','), android.util.Base64.DEFAULT)
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        var sample = 1
+        while (bounds.outWidth / sample > maxPx || bounds.outHeight / sample > maxPx) sample *= 2
+        val full = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
+        android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, full)
+    } catch (_: Exception) {
+        null
     }
 }
 

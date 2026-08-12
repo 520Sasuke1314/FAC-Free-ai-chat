@@ -3,16 +3,10 @@ package com.yourapp.chat.ui.screen.settings
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.graphics.BitmapFactory
-import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -23,7 +17,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -60,21 +53,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.yourapp.chat.ChatApplication
 import com.yourapp.chat.util.CrashLog
 import com.yourapp.chat.util.DataBackup
-import com.yourapp.chat.util.FileUtil
-import java.io.File
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-
-/** 可选头像（emoji） */
-private val AVATAR_OPTIONS = listOf("🐳", "🐱", "🐶", "🦊", "🐼", "🦁", "🐸", "🐙", "🤖", "😀", "😎", "👽")
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -88,26 +74,12 @@ fun SettingsScreen(
     val configRepo = remember { ChatApplication.instance.configRepository }
     var streamingEnabled by remember { mutableStateOf(configRepo.isStreamingEnabled()) }
     var nickname by remember { mutableStateOf(configRepo.getNickname()) }
-    var avatar by remember { mutableStateOf(configRepo.getAvatar()) }
     var persona by remember { mutableStateOf(configRepo.getPersona()) }
     var showAbout by remember { mutableStateOf(false) }
     var showExportConfirm by remember { mutableStateOf(false) }
     var showImportConfirm by remember { mutableStateOf(false) }
     var backupResult by remember { mutableStateOf<Pair<String, Boolean>?>(null) }
     val scope = rememberCoroutineScope()
-
-    // 相册选图 → 复制到应用私有目录，路径存为头像
-    val avatarLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri ->
-        uri?.let {
-            val dest = File(context.filesDir, "avatar_${System.currentTimeMillis()}.jpg")
-            FileUtil.copyUriToFile(context, it, dest)?.let { saved ->
-                avatar = saved.absolutePath
-                configRepo.setAvatar(saved.absolutePath)
-            }
-        }
-    }
 
     // 导出全部数据 → zip（CreateDocument 选保存位置）
     val exportLauncher = rememberLauncherForActivityResult(
@@ -133,16 +105,6 @@ fun SettingsScreen(
         }
     }
 
-    // 解析头像：emoji 或本地图片路径
-    val avatarBitmap = remember(avatar) {
-        val path = when {
-            avatar.startsWith("/") -> avatar
-            avatar.startsWith("file:") -> Uri.parse(avatar).path
-            else -> null
-        }
-        path?.let { BitmapFactory.decodeFile(it) }
-    }
-
     Scaffold(
         contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(0.dp),
         topBar = {
@@ -165,7 +127,7 @@ fun SettingsScreen(
                 .verticalScroll(rememberScrollState())
                 .padding(16.dp)
         ) {
-            // 个人信息（置顶）：头像 + 昵称 + 自定义设定
+            // 个人信息（置顶）：昵称 + 自定义设定
             Text(
                 text = "个人信息",
                 style = MaterialTheme.typography.titleSmall,
@@ -173,78 +135,6 @@ fun SettingsScreen(
             )
             Spacer(Modifier.height(8.dp))
 
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                // 当前头像
-                Box(
-                    modifier = Modifier
-                        .size(56.dp)
-                        .clip(CircleShape)
-                        .background(MaterialTheme.colorScheme.primaryContainer)
-                        .border(2.dp, MaterialTheme.colorScheme.primary, CircleShape),
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (avatarBitmap != null) {
-                        Image(
-                            bitmap = avatarBitmap.asImageBitmap(),
-                            contentDescription = "头像",
-                            modifier = Modifier.fillMaxSize().clip(CircleShape),
-                            contentScale = ContentScale.Crop
-                        )
-                    } else {
-                        Text(
-                            text = avatar.ifBlank { "🐳" },
-                            style = MaterialTheme.typography.headlineMedium
-                        )
-                    }
-                }
-                Spacer(Modifier.width(12.dp))
-                Column(Modifier.weight(1f)) {
-                    Text("选择头像", style = MaterialTheme.typography.bodyMedium)
-                    Text(
-                        "点击下方表情或从相册选择图片",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.outline
-                    )
-                }
-            }
-            Spacer(Modifier.height(8.dp))
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState())
-            ) {
-                AVATAR_OPTIONS.forEach { emoji ->
-                    Box(
-                        modifier = Modifier
-                            .padding(end = 8.dp)
-                            .size(40.dp)
-                            .clip(CircleShape)
-                            .background(
-                                if (emoji == avatar) MaterialTheme.colorScheme.primaryContainer
-                                else MaterialTheme.colorScheme.surfaceVariant
-                            )
-                            .border(
-                                2.dp,
-                                if (emoji == avatar) MaterialTheme.colorScheme.primary
-                                else MaterialTheme.colorScheme.outline.copy(alpha = 0.2f),
-                                CircleShape
-                            )
-                            .clickable {
-                                avatar = emoji
-                                configRepo.setAvatar(emoji)
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(emoji, style = MaterialTheme.typography.titleLarge)
-                    }
-                }
-            }
-            Spacer(Modifier.height(8.dp))
-            // 从相册选择自定义头像
-            TextButton(onClick = { avatarLauncher.launch("image/*") }) {
-                Text("从相册选择自定义头像")
-            }
-            Spacer(Modifier.height(12.dp))
             OutlinedTextField(
                 value = nickname,
                 onValueChange = { nickname = it },

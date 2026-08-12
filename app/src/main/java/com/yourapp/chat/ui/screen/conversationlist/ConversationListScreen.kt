@@ -3,7 +3,6 @@ package com.yourapp.chat.ui.screen.conversationlist
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
@@ -19,6 +18,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -44,6 +44,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -61,6 +62,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.min
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -155,29 +158,40 @@ fun ConversationListScreen(
                 )
             }
         } else {
+            // 与聊天页一致的滚动逻辑：共享 LazyListState + 布局就绪后再恢复位置，
+            // 避免搜索结果/新建删除对话导致 itemCount 变化瞬间首帧错位或跳动
+            val listState = rememberLazyListState()
             LazyColumn(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding),
+                state = listState,
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                userScrollEnabled = true
             ) {
                 items(state.conversations, key = { it.conversation.id }, contentType = { "conversation" }) { item ->
-                    // animateItem：只保留置顶/取消置顶/删除时的位置飞行动画（用户需要的反馈）。
-                    // 关闭淡入淡出（fadeIn/fadeOut = tween(0)）：滚动时新组合的行不再播放透明度
-                    // 动画，避免多对话长列表滚动时逐行动画占用合成线程导致卡顿。
+                    // 不用 animateItem（聊天页同样没有任何条目动画）：位置动画状态机会在滚动
+                    // 换入新行时逐行初始化，多对话长列表滚动时成为主要卡顿源；置顶/删除改为即时重排。
                     ConversationRow(
                         item = item,
-                        modifier = Modifier.animateItem(
-                            fadeInSpec = tween(0),
-                            fadeOutSpec = tween(0),
-                            placementSpec = tween(220)
-                        ),
+                        modifier = Modifier,
                         onOpen = { onOpenChat(item.conversation.id) },
                         onRename = { renaming = item },
                         onDelete = { vm.deleteConversation(item.conversation) },
                         onSwipeRight = { vm.togglePin(item.conversation) }
                     )
+                }
+            }
+            // 数据变化后：等 LazyColumn 布局就绪（itemCount > 0）再校正位置，
+            // 防止 itemCount 骤减（搜索开启/删除对话）时列表停在已不存在的索引上
+            LaunchedEffect(state.conversations.size, searching, listState) {
+                if (state.conversations.isEmpty()) return@LaunchedEffect
+                snapshotFlow { listState.layoutInfo.totalItemsCount }
+                    .filter { it > 0 }
+                    .first()
+                if (listState.firstVisibleItemIndex >= state.conversations.size) {
+                    listState.scrollToItem((state.conversations.size - 1).coerceAtLeast(0))
                 }
             }
         }

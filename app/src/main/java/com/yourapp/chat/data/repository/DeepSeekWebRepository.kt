@@ -63,6 +63,7 @@ class DeepSeekWebRepository(
         searchEnabled: Boolean = false,
         searchProvider: String? = null,
         parentMessageIdOverride: Long? = null,
+        imageDataUrls: List<String> = emptyList(),
         onThinking: (String) -> Unit = {}
     ): Flow<String> = flow {
         val tk = token() ?: throw IllegalStateException("未登录 DeepSeek 官网账号")
@@ -70,6 +71,10 @@ class DeepSeekWebRepository(
         if (sid.isNullOrBlank()) {
             sid = client.createSession(tk)
             prefs.edit().putString(sessionKey(conversationId), sid).apply()
+        }
+        // 图片：先上传到官网文件接口拿 ref_file_id，再随对话请求下发
+        val refFileIds = if (imageDataUrls.isEmpty()) emptyList() else {
+            imageDataUrls.map { url -> client.uploadFile(tk, url) }
         }
         val parent = parentMessageIdOverride ?: parentMessageId(conversationId)
         emitAll(
@@ -81,6 +86,7 @@ class DeepSeekWebRepository(
                 searchEnabled = searchEnabled,
                 searchProvider = searchProvider,
                 parentMessageId = parent,
+                refFileIds = refFileIds,
                 onMessageId = { id ->
                     if (id != null) {
                         prefs.edit().putLong(parentKey(conversationId), id).apply()

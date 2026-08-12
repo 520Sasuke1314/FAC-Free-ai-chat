@@ -214,13 +214,32 @@ class ChatViewModel(
         sendJob?.cancel()
         sendJob = viewModelScope.launch {
             try {
-                val textAttachments = attachments.filter { !it.isImage }
-                val imageAttachments = attachments.filter { it.isImage }
-                // 文本附件直接拼入消息
-                var finalText = text
-                textAttachments.forEach { a ->
-                    finalText = if (finalText.isBlank()) a.content else "$finalText\n\n【附件 ${a.name}】\n${a.content}"
+                val isWebChannel = profile.provider == "deepseek_web"
+                // 官网免费通道不支持图片附件：剔除图片并提示，正文与文本附件照常发送
+                val sendableAttachments = if (isWebChannel) attachments.filter { !it.isImage } else attachments
+                val textAttachments = sendableAttachments.filter { !it.isImage }
+                val imageAttachments = sendableAttachments.filter { it.isImage }
+                if (isWebChannel && attachments.any { it.isImage }) {
+                    _uiState.update { it.copy(info = "官网免费通道不支持图片附件，已忽略图片") }
                 }
+                // 文本附件内容不再拼进消息正文（否则用户消息会显示一大段文件文字）：
+                // 改为经 system 注入提供给 AI，正文只保留用户输入的文字。
+                // 单文件截断 2 万字符、总注入上限 8 万字符，防止超大文件撑爆官网 prompt 长度限制。
+                val attachmentText = textAttachments.joinToString("\n\n") {
+                    "【${it.name}】\n${it.content.take(20000)}"
+                }.take(80000).takeIf { it.isNotBlank() }
+                // 附件元数据：存进用户消息（图片存 dataURL 用于气泡缩略图，文本文件只存名字/类型）
+                val attachedJson = org.json.JSONArray().apply {
+                    attachments.forEach { a ->
+                        val o = org.json.JSONObject()
+                            .put("name", a.name)
+                            .put("mime", a.mimeType)
+                            .put("isImage", a.isImage)
+                        if (a.isImage) o.put("dataUrl", a.content)
+                        put(o)
+                    }
+                }.toString().takeIf { it.isNotBlank() }
+                var finalText = text
                 // 图片附件：若配置了识图模型，先让识图模型描述，描述仅在本地显示给用户，不发给聊天模型；否则原生多模态发送
                 var imageDataUrls: List<String> = emptyList()
                 var visionDescription = ""
@@ -257,7 +276,9 @@ class ChatViewModel(
                     searchEnabled = search,
                     searchProvider = provider,
                     imageDataUrls = imageDataUrls,
-                    visionContext = visionDescription.takeIf { it.isNotBlank() }
+                    visionContext = visionDescription.takeIf { it.isNotBlank() },
+                    attachmentText = attachmentText,
+                    attachmentsJson = attachedJson
                 )
                 _uiState.update {
                     it.copy(

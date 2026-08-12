@@ -42,6 +42,7 @@ class DeepSeekWebClient(private val okHttpClient: OkHttpClient) {
         const val COMPLETION = "$BASE/chat/completion"
         const val CONTINUE = "$BASE/chat/continue"
         const val REGENERATE = "$BASE/chat/regenerate"
+        const val UPLOAD_FILE = "$BASE/upload_file"
 
         val DEFAULT_HEADERS = mapOf(
             // 注意：不能设置 Host 头，OkHttp 禁止手动覆盖（会抛异常）
@@ -135,18 +136,18 @@ class DeepSeekWebClient(private val okHttpClient: OkHttpClient) {
         searchProvider: String? = null,
         parentMessageId: Long? = null,
         pow: String? = null,
+        refFileIds: List<String> = emptyList(),
         onMessageId: (Long?) -> Unit = {},
         onRequestMessageId: (Long?) -> Unit = {},
         onThinking: (String) -> Unit = {},
         onFinished: (contentFilter: Boolean) -> Unit = {}
     ): Flow<String> = flow {
         val solvedPow = pow ?: solvePow(token)
-        logDiag("官网chatStream: sessionId=$sessionId parentId=$parentMessageId 思考=$thinkingEnabled 联网=$searchEnabled")
 
         // 新版协议：除 thinking_enabled 外同时下发 thinking:{"type":...}。
         // 官网对未知字段会 400（如 search_provider），故首次带新字段请求，
         // 若 400 则回退为仅旧字段，保证兼容。
-        var body = completionBody(sessionId, parentMessageId, prompt, thinkingEnabled, searchEnabled, includeThinking = true)
+        var body = completionBody(sessionId, parentMessageId, prompt, thinkingEnabled, searchEnabled, includeThinking = true, refFileIds = refFileIds)
         var bodyStr = body.toString()
         var req = buildRequest(COMPLETION, bodyStr, token, solvedPow)
         var response = withContext(Dispatchers.IO) {
@@ -154,14 +155,13 @@ class DeepSeekWebClient(private val okHttpClient: OkHttpClient) {
         }
         if (!response.isSuccessful && response.code == 400) {
             response.close()
-            body = completionBody(sessionId, parentMessageId, prompt, thinkingEnabled, searchEnabled, includeThinking = false)
+            body = completionBody(sessionId, parentMessageId, prompt, thinkingEnabled, searchEnabled, includeThinking = false, refFileIds = refFileIds)
             bodyStr = body.toString()
             req = buildRequest(COMPLETION, bodyStr, token, solvedPow)
             response = withContext(Dispatchers.IO) {
                 streamingClient.newCall(req).execute()
             }
         }
-        logDiag("官网响应码=${response.code} ${response.message}")
         if (!response.isSuccessful) {
             throw IOException("API error: ${response.code} ${response.message}")
         }
@@ -175,20 +175,57 @@ class DeepSeekWebClient(private val okHttpClient: OkHttpClient) {
         prompt: String,
         thinkingEnabled: Boolean,
         searchEnabled: Boolean,
-        includeThinking: Boolean
+        includeThinking: Boolean,
+        refFileIds: List<String> = emptyList()
     ): JSONObject {
         val b = JSONObject()
             .put("chat_session_id", sessionId)
             .put("model_type", "default")
             .put("parent_message_id", parentMessageId ?: JSONObject.NULL)
             .put("prompt", prompt)
-            .put("ref_file_ids", org.json.JSONArray())
+            .put("ref_file_ids", org.json.JSONArray(refFileIds))
             .put("thinking_enabled", thinkingEnabled)
             .put("search_enabled", searchEnabled)
         if (includeThinking) {
             b.put("thinking", JSONObject().put("type", if (thinkingEnabled) "enabled" else "disabled"))
         }
         return b
+    }
+
+    /**
+     * 上传图片到官网文件接口，返回 ref_file_id（随 completion 请求的 ref_file_ids 下发）。
+     * @param imageDataUrl data:image/xxx;base64,... 格式
+     */
+    suspend fun uploadFile(token: String, imageDataUrl: String): String {
+        val comma = imageDataUrl.indexOf(',')
+        val header = if (comma > 0) imageDataUrl.substring(0, comma) else ""
+        val mime = header.removePrefix("data:").substringBefore(";")
+        val b64 = if (comma >= 0) imageDataUrl.substring(comma + 1) else imageDataUrl
+        val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+        if (bytes.isEmpty()) throw IOException("图片数据为空")
+        val media = (mime.ifBlank { "image/jpeg" }).toMediaTypeOrNull()
+        val body = okhttp3.MultipartBody.Builder()
+            .setType(okhttp3.MultipartBody.FORM)
+            .addFormDataPart("file", "image.${mime.substringAfter("/", "jpg")}", bytes.toRequestBody(media))
+            .build()
+        val builder = Request.Builder().url(UPLOAD_FILE).post(body)
+        for ((k, v) in DEFAULT_HEADERS) builder.header(k, v)
+        builder.header("authorization", "Bearer $token")
+        val response = withContext(Dispatchers.IO) { okHttpClient.newCall(builder.build()).execute() }
+        response.use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw IOException("图片上传失败: HTTP ${resp.code} ${resp.message}")
+            val json = runCatching { JSONObject(text) }.getOrElse { throw IOException("图片上传失败: 响应解析失败") }
+            if (json.optInt("code") != 0) throw IOException("图片上传失败: ${json.optString("msg").ifBlank { json.optString("message") }}")
+            val data = json.opt("data")
+            val id = when (data) {
+                is JSONObject -> data.optString("id").takeIf { it.isNotBlank() }
+                    ?: data.optString("file_id").takeIf { it.isNotBlank() }
+                is String -> data.takeIf { it.isNotBlank() }
+                else -> null
+            }
+            return id ?: throw IOException("图片上传失败: 响应中没有文件 id")
+        }
     }
 
     /**
@@ -413,7 +450,6 @@ class DeepSeekWebClient(private val okHttpClient: OkHttpClient) {
         onFinished: (contentFilter: Boolean) -> Unit = {}
     ): Flow<String> = flow {
         val solvedPow = solvePow(token)
-        logDiag("官网regenerate: sessionId=$sessionId childId=$childMessageId 思考=$thinkingEnabled 联网=$searchEnabled")
 
         // 同 completion 通道：优先带新版 thinking 对象，400 时回退仅旧字段
         var body = regenerateBody(sessionId, childMessageId, thinkingEnabled, searchEnabled, includeThinking = true)
@@ -429,7 +465,6 @@ class DeepSeekWebClient(private val okHttpClient: OkHttpClient) {
                 streamingClient.newCall(req).execute()
             }
         }
-        logDiag("官网regenerate响应码=${response.code} ${response.message}")
         if (!response.isSuccessful) {
             throw IOException("API error: ${response.code} ${response.message}")
         }
@@ -748,15 +783,6 @@ class DeepSeekWebClient(private val okHttpClient: OkHttpClient) {
         token?.let { builder.header("authorization", "Bearer $it") }
         pow?.let { builder.header("x-ds-pow-response", it) }
         return builder.build()
-    }
-
-    /** 诊断日志：写入崩溃日志文件 */
-    private fun logDiag(text: String) {
-        try {
-            val app = com.yourapp.chat.ChatApplication.instance
-            com.yourapp.chat.util.CrashLog.append(app, "[DeepSeekWebClient] $text")
-        } catch (_: Exception) {
-        }
     }
 
     private fun checkBiz(json: JSONObject, errPrefix: String) {
