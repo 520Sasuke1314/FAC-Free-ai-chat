@@ -142,7 +142,42 @@ class DeepSeekWebClient(private val okHttpClient: OkHttpClient) {
     ): Flow<String> = flow {
         val solvedPow = pow ?: solvePow(token)
         logDiag("官网chatStream: sessionId=$sessionId parentId=$parentMessageId 思考=$thinkingEnabled 联网=$searchEnabled")
-        val body = JSONObject()
+
+        // 新版协议：除 thinking_enabled 外同时下发 thinking:{"type":...}。
+        // 官网对未知字段会 400（如 search_provider），故首次带新字段请求，
+        // 若 400 则回退为仅旧字段，保证兼容。
+        var body = completionBody(sessionId, parentMessageId, prompt, thinkingEnabled, searchEnabled, includeThinking = true)
+        var bodyStr = body.toString()
+        var req = buildRequest(COMPLETION, bodyStr, token, solvedPow)
+        var response = withContext(Dispatchers.IO) {
+            streamingClient.newCall(req).execute()
+        }
+        if (!response.isSuccessful && response.code == 400) {
+            response.close()
+            body = completionBody(sessionId, parentMessageId, prompt, thinkingEnabled, searchEnabled, includeThinking = false)
+            bodyStr = body.toString()
+            req = buildRequest(COMPLETION, bodyStr, token, solvedPow)
+            response = withContext(Dispatchers.IO) {
+                streamingClient.newCall(req).execute()
+            }
+        }
+        logDiag("官网响应码=${response.code} ${response.message}")
+        if (!response.isSuccessful) {
+            throw IOException("API error: ${response.code} ${response.message}")
+        }
+        emitAll(parseWebStream(response, thinkingEnabled, onMessageId, onRequestMessageId, onThinking, onFinished))
+    }
+
+    /** 官网对话请求体：新版 thinking 对象可选（部分旧协议接口不识别该字段） */
+    private fun completionBody(
+        sessionId: String,
+        parentMessageId: Long?,
+        prompt: String,
+        thinkingEnabled: Boolean,
+        searchEnabled: Boolean,
+        includeThinking: Boolean
+    ): JSONObject {
+        val b = JSONObject()
             .put("chat_session_id", sessionId)
             .put("model_type", "default")
             .put("parent_message_id", parentMessageId ?: JSONObject.NULL)
@@ -150,20 +185,10 @@ class DeepSeekWebClient(private val okHttpClient: OkHttpClient) {
             .put("ref_file_ids", org.json.JSONArray())
             .put("thinking_enabled", thinkingEnabled)
             .put("search_enabled", searchEnabled)
-        // 官网不识别 search_provider 字段，盲目添加会导致请求被拒（400）。
-        // 搜索引擎仅通过 search_enabled 开关控制，provider 保留给未来协议支持。
-        val bodyStr = body.toString()
-
-        // 网络请求在 IO 线程执行，SSE 解析与 emit 留在 flow 上下文（与 collect 同一线程）。
-        val req = buildRequest(COMPLETION, bodyStr, token, solvedPow)
-        val response = withContext(Dispatchers.IO) {
-            streamingClient.newCall(req).execute()
+        if (includeThinking) {
+            b.put("thinking", JSONObject().put("type", if (thinkingEnabled) "enabled" else "disabled"))
         }
-        logDiag("官网响应码=${response.code} ${response.message}")
-        if (!response.isSuccessful) {
-            throw IOException("API error: ${response.code} ${response.message}")
-        }
-        emitAll(parseWebStream(response, thinkingEnabled, onMessageId, onRequestMessageId, onThinking, onFinished))
+        return b
     }
 
     /**
@@ -389,21 +414,46 @@ class DeepSeekWebClient(private val okHttpClient: OkHttpClient) {
     ): Flow<String> = flow {
         val solvedPow = solvePow(token)
         logDiag("官网regenerate: sessionId=$sessionId childId=$childMessageId 思考=$thinkingEnabled 联网=$searchEnabled")
-        val body = JSONObject()
-            .put("chat_session_id", sessionId)
-            .put("child_message_id", childMessageId)
-            .put("thinking_enabled", thinkingEnabled)
-            .put("search_enabled", searchEnabled)
-            .put("user_options", JSONObject.NULL)
-        val req = buildRequest(REGENERATE, body.toString(), token, solvedPow)
-        val response = withContext(Dispatchers.IO) {
+
+        // 同 completion 通道：优先带新版 thinking 对象，400 时回退仅旧字段
+        var body = regenerateBody(sessionId, childMessageId, thinkingEnabled, searchEnabled, includeThinking = true)
+        var req = buildRequest(REGENERATE, body.toString(), token, solvedPow)
+        var response = withContext(Dispatchers.IO) {
             streamingClient.newCall(req).execute()
+        }
+        if (!response.isSuccessful && response.code == 400) {
+            response.close()
+            body = regenerateBody(sessionId, childMessageId, thinkingEnabled, searchEnabled, includeThinking = false)
+            req = buildRequest(REGENERATE, body.toString(), token, solvedPow)
+            response = withContext(Dispatchers.IO) {
+                streamingClient.newCall(req).execute()
+            }
         }
         logDiag("官网regenerate响应码=${response.code} ${response.message}")
         if (!response.isSuccessful) {
             throw IOException("API error: ${response.code} ${response.message}")
         }
         emitAll(parseWebStream(response, thinkingEnabled, onMessageId, onRequestMessageId, onThinking, onFinished))
+    }
+
+    /** 官网重新生成请求体：新版 thinking 对象可选（400 时回退） */
+    private fun regenerateBody(
+        sessionId: String,
+        childMessageId: Long,
+        thinkingEnabled: Boolean,
+        searchEnabled: Boolean,
+        includeThinking: Boolean
+    ): JSONObject {
+        val b = JSONObject()
+            .put("chat_session_id", sessionId)
+            .put("child_message_id", childMessageId)
+            .put("thinking_enabled", thinkingEnabled)
+            .put("search_enabled", searchEnabled)
+            .put("user_options", JSONObject.NULL)
+        if (includeThinking) {
+            b.put("thinking", JSONObject().put("type", if (thinkingEnabled) "enabled" else "disabled"))
+        }
+        return b
     }
 
     /** 从 SSE chunk 提取回复 message_id（供 parent_message_id 链接） */

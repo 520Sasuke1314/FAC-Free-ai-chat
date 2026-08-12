@@ -37,13 +37,13 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -67,9 +67,6 @@ import com.yourapp.chat.util.CrashLog
 import com.yourapp.chat.util.FileUtil
 import java.io.File
 import kotlinx.coroutines.delay
-
-/** 流式刷新频率档位（毫秒） */
-private val REFRESH_OPTIONS = listOf(50 to "50ms 流畅", 100 to "100ms 均衡", 200 to "200ms 省电", 500 to "500ms 极省电")
 
 /** 可选头像（emoji） */
 private val AVATAR_OPTIONS = listOf("🐳", "🐱", "🐶", "🦊", "🐼", "🦁", "🐸", "🐙", "🤖", "😀", "😎", "👽")
@@ -331,31 +328,44 @@ fun SettingsScreen(
                 }
                 if (streamingEnabled) {
                     HorizontalDivider(Modifier.padding(vertical = 8.dp))
-                    Text(
-                        text = "刷新频率",
-                        style = MaterialTheme.typography.titleSmall
-                    )
-                    Text(
-                        text = "AI 回答流式输出时界面的刷新间隔，频率越高文字越平滑、CPU 占用越高",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.outline
-                    )
-                    Spacer(Modifier.height(8.dp))
                     Row(
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp)
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        REFRESH_OPTIONS.forEach { (ms, label) ->
-                            FilterChip(
-                                selected = refreshMs == ms,
-                                onClick = {
-                                    refreshMs = ms
-                                    configRepo.setStreamRefreshMs(ms)
-                                },
-                                label = { Text(label) }
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                text = "刷新频率",
+                                style = MaterialTheme.typography.titleSmall
+                            )
+                            Text(
+                                text = "AI 回答流式输出时界面的刷新间隔：数值越小文字越平滑、CPU 占用越高",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.outline
                             )
                         }
+                        Text(
+                            text = "${refreshMs}ms",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.primary
+                        )
                     }
+                    Slider(
+                        value = refreshMs.toFloat(),
+                        onValueChange = {
+                            refreshMs = it.toInt()
+                            configRepo.setStreamRefreshMs(it.toInt())
+                        },
+                        onValueChangeFinished = {
+                            configRepo.setStreamRefreshMs(refreshMs)
+                        },
+                        valueRange = 1f..500f,
+                        steps = 498
+                    )
+                    Text(
+                        text = "1ms（最快，高 CPU） · 500ms（最省电）",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
                 }
             }
             // 流式刷新频率演示文章：切换频率时按新节奏重新逐字显示，直观对比刷新效果

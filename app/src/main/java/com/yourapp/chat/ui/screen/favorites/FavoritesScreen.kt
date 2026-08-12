@@ -1,9 +1,9 @@
 package com.yourapp.chat.ui.screen.favorites
 
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.tween
 import android.content.Context
 import android.widget.Toast
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -188,7 +188,10 @@ fun FavoritesScreen(
                 items(state.items, key = { it.message.id }, contentType = { "favorite" }) { item ->
                     FavoriteRow(
                         item = item,
-                        modifier = Modifier.animateItem(),
+                        modifier = Modifier.animateItem(
+                            fadeInSpec = tween(0),
+                            fadeOutSpec = tween(0)
+                        ),
                         selectionMode = state.isSelectionMode,
                         selected = state.selectedIds.contains(item.message.id),
                         onClick = {
@@ -297,18 +300,17 @@ private fun FavoriteRow(
                         .size(24.dp)
                 )
             } else {
-                // 拖动时显示置顶预览图标
+                // 拖动预览/默认图标用普通 if/else 切换（列表行内不用 AnimatedVisibility，
+                // 它会在滚动组合新行时为每行创建过渡状态机，长列表滚动卡顿）
                 val showPinPreview = dragOffset > thresholdPx * 0.3f
-                AnimatedVisibility(visible = showPinPreview) {
+                if (showPinPreview) {
                     Icon(
-                        Icons.Filled.PushPin, 
-                        contentDescription = "向右滑动置顶", 
+                        Icons.Filled.PushPin,
+                        contentDescription = "向右滑动置顶",
                         tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
                         modifier = Modifier.size(24.dp)
                     )
-                }
-                // 默认收藏图标
-                AnimatedVisibility(visible = !showPinPreview) {
+                } else {
                     Icon(Icons.Filled.Star, contentDescription = "收藏", modifier = Modifier.size(24.dp))
                 }
             }

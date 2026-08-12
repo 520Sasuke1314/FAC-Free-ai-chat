@@ -1,9 +1,9 @@
 package com.yourapp.chat.ui.screen.conversationlist
 
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
@@ -162,10 +162,15 @@ fun ConversationListScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 items(state.conversations, key = { it.conversation.id }, contentType = { "conversation" }) { item ->
-                    // 不使用 animateItem：行内位移动画会持续占用合成线程（置顶重排/删除时整列
-                    // 逐条插值），列表长时滚动明显卡顿；内容随状态直接重排即可
+                    // animateItem：只保留置顶/取消置顶/删除时的位置飞行动画（用户需要的反馈）。
+                    // 关闭淡入淡出（fadeIn/fadeOut = tween(0)）：滚动时新组合的行不再播放透明度
+                    // 动画，避免多对话长列表滚动时逐行动画占用合成线程导致卡顿。
                     ConversationRow(
                         item = item,
+                        modifier = Modifier.animateItem(
+                            fadeInSpec = tween(0),
+                            fadeOutSpec = tween(0)
+                        ),
                         onOpen = { onOpenChat(item.conversation.id) },
                         onRename = { renaming = item },
                         onDelete = { vm.deleteConversation(item.conversation) },
@@ -301,28 +306,27 @@ private fun ConversationRow(
                     .size(24.dp)
             )
         } else {
-            // 拖动时显示置顶预览图标（未置顶时向右拖动显示）
+            // 拖动预览图标 + 默认图标。
+            // 用普通 if/else 替代 AnimatedVisibility：列表行内的 AnimatedVisibility 在滚动
+            // 组合新行时会为每行创建整套过渡状态机，多对话长列表滚动明显卡顿；预览图标
+            // 本来也不需要动画，直接按拖动状态切换即可。
             val showPinPreview = dragOffset > thresholdPx * 0.3f
-            AnimatedVisibility(visible = showPinPreview) {
+            val showUnpinPreview = dragOffset < -thresholdPx * 0.3f
+            if (showPinPreview) {
                 Icon(
-                    Icons.Filled.PushPin, 
-                    contentDescription = "向右滑动置顶", 
+                    Icons.Filled.PushPin,
+                    contentDescription = "向右滑动置顶",
                     tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
                     modifier = Modifier.size(24.dp)
                 )
-            }
-            // 拖动时显示取消置顶预览图标（已置顶时向左拖动显示）
-            val showUnpinPreview = dragOffset < -thresholdPx * 0.3f
-            AnimatedVisibility(visible = showUnpinPreview) {
+            } else if (showUnpinPreview) {
                 Icon(
-                    Icons.Filled.PushPin, 
-                    contentDescription = "向左滑动取消置顶", 
+                    Icons.Filled.PushPin,
+                    contentDescription = "向左滑动取消置顶",
                     tint = MaterialTheme.colorScheme.error.copy(alpha = 0.7f),
                     modifier = Modifier.size(24.dp)
                 )
-            }
-            // 默认聊天图标
-            AnimatedVisibility(visible = !showPinPreview && !showUnpinPreview) {
+            } else {
                 Icon(Icons.Filled.Chat, contentDescription = null, modifier = Modifier.size(24.dp))
             }
         }
