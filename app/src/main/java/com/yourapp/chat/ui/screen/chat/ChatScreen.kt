@@ -1187,7 +1187,10 @@ val stripped = if (isWeb) raw.replace(ReferenceRegex, "").trim() else raw
             // 用户消息用 wrapContentWidth：气泡只包裹文字，四边内边距一致，
             // 使文字到背景边框的距离与左侧 AI 气泡相同（而非通栏后右侧空一大块）。
             // animateContentSize：流式生成时气泡背景随文字平滑扩展（参考 rikkahub）
-            modifier = (if (isUser) Modifier.wrapContentWidth() else Modifier.fillMaxWidth())
+            modifier = (if (isUser)
+                    Modifier.wrapContentWidth().padding(end = 16.dp)
+                else
+                    Modifier.fillMaxWidth())
                 .animateContentSize(animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy))
         ) {
             Column(
@@ -2145,8 +2148,9 @@ private fun ChatSettingsPage(
                 val levelOptions = listOf(
                     Triple(-1, "默认", "交给模型决定力度"),
                     Triple(1, "低", "较少思考"),
-                    Triple(2, "高", "较多思考"),
-                    Triple(3, "最强", "全力思考")
+                    Triple(2, "中", "适度思考"),
+                    Triple(3, "高", "较多思考"),
+                    Triple(4, "最强", "全力思考")
                 )
                 Column {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

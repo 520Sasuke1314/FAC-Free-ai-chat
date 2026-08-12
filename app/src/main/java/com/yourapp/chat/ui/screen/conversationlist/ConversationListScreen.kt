@@ -1,9 +1,14 @@
 package com.yourapp.chat.ui.screen.conversationlist
 
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
@@ -17,9 +22,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Chat
@@ -154,23 +159,20 @@ fun ConversationListScreen(
                 )
             }
         } else {
-            // LazyColumn + animateItem：置顶/取消置顶行飞行动画（往上飞到顶部/往下飞回原位）
-            // 淡入淡出关闭（tween(0)），只保留位置飞行
-            LazyColumn(
+            // 与设置页同款：Column + verticalScroll（一次性组合、滚动零组合开销，丝滑）
+            // 条目内部保留：右滑置顶拖拽动画、置顶图标旋转动画、zIndex 抬升
+            Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(padding),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp),
+                    .padding(padding)
+                    .padding(horizontal = 16.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(state.conversations, key = { it.conversation.id }, contentType = { "conversation" }) { item ->
+                state.conversations.forEach { item ->
                     ConversationRow(
                         item = item,
-                        modifier = Modifier.animateItem(
-                            fadeInSpec = tween(0),
-                            fadeOutSpec = tween(0),
-                            placementSpec = tween(220)
-                        ),
                         onOpen = { onOpenChat(item.conversation.id) },
                         onRename = { renaming = item },
                         onDelete = { vm.deleteConversation(item.conversation) },
