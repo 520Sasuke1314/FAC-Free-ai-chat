@@ -1,0 +1,262 @@
+package com.yourapp.chat.data.remote
+
+import com.google.gson.Gson
+import com.yourapp.chat.data.remote.model.ChatRequest
+import com.yourapp.chat.data.remote.model.ChatResponse
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.IOException
+import java.util.concurrent.TimeUnit
+
+class SseClient(private val okHttpClient: OkHttpClient) {
+    private val gson = Gson()
+    // 流式读取专用 client：空闲读超时 60s。若接口保持连接但不返回数据，
+    // 阻塞在 readUtf8Line() 会永久卡住导致 UI 一直显示省略号；超时后抛出
+    // SocketTimeoutException，让上层结束生成状态并显示错误。
+    private val streamingClient: OkHttpClient = okHttpClient.newBuilder()
+        .readTimeout(60, TimeUnit.SECONDS)
+        .build()
+
+    /**
+     * OpenAI 兼容的 SSE 流式对话接口。
+     * 返回的 Flow 逐段发出增量文本。
+     * @param onThinking 思考内容回调（reasoning_content 字段）
+     */
+    suspend fun chatStream(
+        baseUrl: String,
+        apiKey: String,
+        request: ChatRequest,
+        onThinking: (String) -> Unit = {}
+    ): Flow<String> = flow {
+        val jsonBody = if (request.images.isEmpty()) {
+            gson.toJson(request)
+        } else {
+            // 原生多模态：把最后一条用户消息的 content 展开为内容数组（text + image_url）。
+            // Gson 会把 images 字段序列化进去，但标准接口不认识它，需在此手动剔除并重组。
+            val root = com.google.gson.JsonParser.parseString(gson.toJson(request)).asJsonObject
+            root.remove("images")
+            val msgs = root.getAsJsonArray("messages")
+            if (msgs.size() > 0) {
+                val last = msgs.get(msgs.size() - 1).asJsonObject
+                val text = last.get("content").takeIf { !it.isJsonNull }?.asString ?: ""
+                val contentArr = com.google.gson.JsonArray()
+                if (text.isNotBlank()) {
+                    val t = com.google.gson.JsonObject()
+                    t.addProperty("type", "text")
+                    t.addProperty("text", text)
+                    contentArr.add(t)
+                }
+                request.images.forEach { dataUrl ->
+                    val img = com.google.gson.JsonObject()
+                    img.addProperty("type", "image_url")
+                    val u = com.google.gson.JsonObject()
+                    u.addProperty("url", dataUrl)
+                    img.add("image_url", u)
+                    contentArr.add(img)
+                }
+                last.add("content", contentArr)
+            }
+            root.toString()
+        }
+        val reqBody = jsonBody.toRequestBody("application/json".toMediaTypeOrNull())
+        val fullUrl = "${baseUrl.trimEnd('/')}/chat/completions"
+        val httpRequest = Request.Builder()
+            .url(fullUrl)
+            .addHeader("Authorization", "Bearer $apiKey")
+            .addHeader("Content-Type", "application/json")
+            .post(reqBody)
+            .build()
+        logDiag("请求 URL=$fullUrl 模型=${request.model}")
+
+        val response = withContext(Dispatchers.IO) {
+            streamingClient.newCall(httpRequest).execute()
+        }
+        logDiag("响应码=${response.code} ${response.message}")
+        if (!response.isSuccessful) {
+            val errBody = response.body?.string().orEmpty()
+            logDiag("非 2xx 响应体=$errBody")
+            throw IOException("API error: ${response.code} ${response.message} $errBody")
+        }
+        val source = response.body?.source() ?: throw IOException("Empty body")
+        // 收集推理内容（reasoning_content，DeepSeek/GLM/Kimi 等思考模型），
+        // 在首个正文 token 前以 [思考]...[/思考] 前缀输出，供消息气泡折叠展示。
+        val reasoning = StringBuilder()
+        var reasoningEmitted = false
+        // 是否发出了任何内容（思考或正文）；是否发出了非空白正文
+        var emitted = false
+        var bodyEmitted = false
+        // 原始响应累积，用于非流式 JSON 兜底 & 空响应时把真实返回抛给上层诊断
+        val rawBody = StringBuilder()
+        // 无正文保护：接口可能持续返回 data 帧（空 delta / role 帧 / 心跳），
+        // 这种"有数据但无正文"不会触发 readTimeout，导致循环永不结束、UI 永远省略号。
+        // 只要在限定时间内没有解析出任何非空正文，就主动报错并把原始返回带上。
+        val startedAt = System.currentTimeMillis()
+        // 性能优化：累积式节流 emit —— 每满一批（约 60 字符）或距上次推送超过
+        // 50ms 就批量 emit 一次，提高帧率至 ~20fps，实现德芙般丝滑流式体验。
+        var lastEmitTime = System.currentTimeMillis()
+        val accumulatedContent = StringBuilder()
+        // 网络读行在 IO 线程执行，解析与 emit 留在 flow 上下文（与 collect 同一线程），
+        // 从机制上保证 emit 与 collect 上下文一致，彻底避免跨线程 emit 违规。
+        try {
+                try {
+                    var lineCount = 0
+                    var emittedCount = 0
+                    while (true) {
+                        val line = withContext(Dispatchers.IO) {
+                            if (source.exhausted()) null else source.readUtf8Line()
+                        } ?: break
+                        val trimmed = line.trim()
+                        lineCount++
+                        if (trimmed.isEmpty()) continue
+                        rawBody.append(trimmed).append('\n')
+                        // 兼容 `data:{...}`（无空格）与 `data: {...}` 两种常见 SSE 格式
+                        if (trimmed.startsWith("data:")) {
+                            val data = trimmed.removePrefix("data:").trim()
+                            if (data == "[DONE]") {
+                                logDiag("收到 [DONE]")
+                                break
+                            }
+                            // 解析与 emit 分离：只有 fromJson 在 try-catch 内，
+                            // emit 异常不会被误记为「解析失败」，也不会破坏 Flow 异常透明性。
+                            val chunk = try {
+                                gson.fromJson(data, ChatResponse::class.java)
+                            } catch (e: Exception) {
+                                logDiag("单行解析失败: ${e.javaClass.simpleName}: ${e.message} | $data")
+                                null
+                            }
+                            chunk?.choices?.firstOrNull()?.let { choice ->
+                                val delta = choice.delta
+                                // 兼容部分中转站：流式分片把正文放在 message 而非 delta
+                                val reasoningText = delta?.reasoning_content
+                                val contentText = delta?.content ?: choice.message?.content
+                                if (reasoningText != null) {
+                                    reasoning.append(reasoningText)
+                                    onThinking(reasoningText)
+                                }
+                                contentText?.let { content ->
+                                    // 不再在 SseClient 层面注入 [思考] 标签，由上层统一处理
+                                    // 这样保持与官网通道一致：thinking 通过 onThinking 回调，正文通过 emit
+                                    emitted = true
+                                    if (content.isNotBlank()) bodyEmitted = true
+                                    emittedCount++
+                                    // 累积内容，达到节流阈值（60 字符 / 50ms）时批量 emit，提升帧率至 ~20fps
+                                    accumulatedContent.append(content)
+                                    val now = System.currentTimeMillis()
+                                    if (accumulatedContent.length >= 60 || now - lastEmitTime >= 50) {
+                                        val batch = accumulatedContent.toString()
+                                        accumulatedContent.clear()
+                                        lastEmitTime = now
+                                        emit(batch)
+                                    }
+                                }
+                            }
+                        }
+                        // 性能优化：每50行记录一次日志，减少日志频率
+                        if (lineCount % 50 == 0) logDiag("已读 ${lineCount} 行, emit ${emittedCount} 次")
+                        // 无正文保护：思考中（有 reasoning）给 120s，否则 25s。
+                        // 达到时限仍无正文 → 中断并抛错，避免界面永远显示省略号。
+                        if (!bodyEmitted) {
+                            val limit = if (reasoning.isNotEmpty()) 120_000L else 25_000L
+                            if (System.currentTimeMillis() - startedAt > limit) {
+                                val snippet = rawBody.toString().trim().take(800)
+                                logDiag("无正文超时, 已读 ${lineCount} 行, 原始: $snippet")
+                                throw IOException(
+                                    "接口在 ${limit / 1000} 秒内未返回任何正文" +
+                                        (if (snippet.isNotEmpty()) "。接口原始返回：\n$snippet" else "（接口未返回任何数据）")
+                                )
+                            }
+                        }
+                    }
+                    logDiag("循环结束, 共读 ${lineCount} 行, emit ${emittedCount} 次")
+                } catch (e: java.net.SocketTimeoutException) {
+                    logDiag("SocketTimeout: ${e.message}")
+                    throw IOException(
+                        "接口响应超时（60 秒内未收到任何数据）。请检查网络，或该接口是否支持流式输出、模型名是否正确。"
+                    )
+                }
+        } finally {
+            response.close()
+        }
+        // 优化：批量推送剩余的累积内容
+        if (accumulatedContent.isNotEmpty()) {
+            emit(accumulatedContent.toString())
+        }
+        // 非流式兜底：兼容忽略 stream=true 直接返回完整 JSON 的服务
+        // （Ollama / 中转站等），覆盖整段 JSON、美化打印 JSON、每行一个 JSON 三种情况
+        if (reasoning.isEmpty() && rawBody.isNotEmpty()) {
+            val raw = rawBody.toString()
+            // 1) 整段直接解析（单行完整 JSON / 美化打印的多行 JSON）
+            try {
+                val whole = gson.fromJson(raw, ChatResponse::class.java)
+                whole?.choices?.firstOrNull()?.let { c ->
+                    (c.delta?.content ?: c.message?.content)?.takeIf { it.isNotBlank() }?.let {
+                        emitted = true
+                        bodyEmitted = true
+                        emit(it)
+                    }
+                }
+            } catch (e: Exception) {
+                // 忽略：整段不是合法 JSON
+            }
+            // 2) 逐行解析（每行一个 JSON 的非标准流式返回）
+            if (!emitted) {
+                for (line in raw.lines()) {
+                    val candidate = line.removePrefix("data:").trim()
+                    if (candidate.isEmpty() || candidate == "[DONE]") continue
+                    try {
+                        val whole = gson.fromJson(candidate, ChatResponse::class.java)
+                        whole?.choices?.firstOrNull()?.let { c ->
+                            (c.delta?.content ?: c.message?.content)?.takeIf { it.isNotBlank() }?.let {
+                                emitted = true
+                                bodyEmitted = true
+                                emit(it)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        // 忽略单行解析错误
+                    }
+                }
+            }
+        }
+        // 没有任何非空白正文：把真实原因抛给上层，而不是让界面永远只显示省略号。
+        if (!bodyEmitted) {
+            if (reasoning.isNotEmpty()) {
+                throw IOException("模型只返回了思考内容，没有输出正文（请检查模型类型 / 接口配置是否支持输出正文）。")
+            }
+            val snippet = rawBody.toString().trim().take(300)
+            val apiError = extractErrorFromRaw(rawBody.toString())
+            throw IOException(
+                "接口未返回任何可显示内容（请检查模型名、baseUrl 与参数是否被该接口支持）。" +
+                    (apiError?.let { "\n接口错误信息：$it" }
+                        ?: if (snippet.isNotEmpty()) "\n接口原始返回：$snippet" else "\n接口返回为空")
+            )
+        }
+    }
+
+    /** 从原始响应中尝试提取 OpenAI 风格错误信息 {"error":{"message":"..."}} */
+    private fun extractErrorFromRaw(raw: String): String? {
+        val singleLine = raw.lines().firstOrNull()?.removePrefix("data:")?.trim() ?: return null
+        return try {
+            val obj = org.json.JSONObject(singleLine)
+            val err = obj.optJSONObject("error")
+            err?.optString("message")?.takeIf { it.isNotBlank() }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** 流式诊断日志：写入崩溃日志文件，供「关于软件 → 崩溃日志」导出排查 */
+    private fun logDiag(text: String) {
+        try {
+            val app = com.yourapp.chat.ChatApplication.instance
+            com.yourapp.chat.util.CrashLog.append(app, "[SseClient] $text")
+        } catch (_: Exception) {
+        }
+    }
+}
