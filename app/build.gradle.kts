@@ -81,6 +81,9 @@ dependencies {
     // Coil
     implementation("io.coil-kt:coil-compose:2.5.0")
 
+    // Shizuku：用于授予联网搜索权限（通过 Shizuku 在手机上执行网页搜索）
+    implementation("dev.rikka.shizuku:api:13.1.5")
+
     // Testing
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

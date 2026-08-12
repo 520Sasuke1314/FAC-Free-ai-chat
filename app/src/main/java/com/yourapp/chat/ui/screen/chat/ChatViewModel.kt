@@ -16,6 +16,8 @@ import com.yourapp.chat.data.repository.CharacterCardRepository
 import com.yourapp.chat.data.repository.ConfigRepository
 import com.yourapp.chat.data.repository.WorldEntryRepository
 import com.yourapp.chat.data.local.AppDatabase
+import com.yourapp.chat.data.remote.PhoneWebSearch
+import com.yourapp.chat.data.remote.ShizukuHelper
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -83,7 +85,11 @@ data class ChatUiState(
     /** 官网同步版本号：每次成功同步 +1，UI 据此在同步完成后回到列表底部 */
     val syncVersion: Int = 0,
     /** 处理状态（如识图中、OCR中），用于在输入区显示进度 */
-    val processingStatus: String? = null
+    val processingStatus: String? = null,
+    /** 自建 API 联网搜索：是否正在浏览网页 */
+    val webBrowsing: Boolean = false,
+    /** 待触发 Shizuku 授权（联网搜索需要该权限，UI 监听到 true 时弹出授权窗口） */
+    val shizukuGrantRequested: Boolean = false
 )
 
 /** 待发送附件：图片存 dataURL，文本直接存内容 */
@@ -211,9 +217,36 @@ class ChatViewModel(
         val thinking = resolveThinking()
         val search = _uiState.value.searchEnabled
         val provider = _uiState.value.searchProvider
+        val isWebChannel = profile.provider == "deepseek_web"
+        // 自建 API 联网搜索需要 Shizuku 授权：未授权则弹出授权窗口并中止本次发送
+        if (search && !isWebChannel && !ShizukuHelper.isGranted()) {
+            _uiState.update {
+                it.copy(isSending = false, shizukuGrantRequested = true, error = null, info = "联网搜索需要 Shizuku 授权，请在弹出的窗口中点击「允许」后再发送")
+            }
+            return
+        }
         sendJob?.cancel()
         sendJob = viewModelScope.launch {
             try {
+                // 自建 API 联网搜索：用手机网络浏览网页，注入结果给 AI
+                var webSearchPrompt: String? = null
+                var webSourcesJson: String? = null
+                if (search && !isWebChannel) {
+                    _uiState.update { it.copy(webBrowsing = true) }
+                    try {
+                        val results = PhoneWebSearch.search(text, limit = 5)
+                        if (results.isEmpty()) {
+                            _uiState.update { it.copy(info = "没有搜索到相关网页，将直接回答") }
+                        } else {
+                            webSearchPrompt = PhoneWebSearch.buildPrompt(results)
+                            webSourcesJson = PhoneWebSearch.buildSourcesJson(results)
+                        }
+                    } catch (e: Exception) {
+                        _uiState.update { it.copy(info = "联网搜索失败：${e.message}") }
+                    } finally {
+                        _uiState.update { it.copy(webBrowsing = false) }
+                    }
+                }
                 val isWebChannel = profile.provider == "deepseek_web"
                 // 官网免费通道不支持图片附件：剔除图片并提示，正文与文本附件照常发送
                 val sendableAttachments = if (isWebChannel) attachments.filter { !it.isImage } else attachments
@@ -275,6 +308,8 @@ class ChatViewModel(
                     thinkingEnabled = thinking,
                     searchEnabled = search,
                     searchProvider = provider,
+                    webSearchPrompt = webSearchPrompt,
+                    webSourcesJson = webSourcesJson,
                     imageDataUrls = imageDataUrls,
                     visionContext = visionDescription.takeIf { it.isNotBlank() },
                     attachmentText = attachmentText,
@@ -595,6 +630,37 @@ class ChatViewModel(
 
     fun setSearch(enabled: Boolean) {
         _uiState.update { it.copy(searchEnabled = enabled) }
+        // 打开自建 API 联网搜索时立即申请 Shizuku 权限（未授予则弹窗）
+        if (enabled) {
+            val isWeb = _uiState.value.apiProfiles.firstOrNull { it.id == _uiState.value.selectedProfileId }?.provider == "deepseek_web"
+            if (!isWeb && !ShizukuHelper.isGranted()) {
+                _uiState.update { it.copy(shizukuGrantRequested = true, info = "联网搜索需要 Shizuku 授权，请在弹出的窗口中点击「允许」") }
+            }
+        }
+    }
+
+    /** 仅供 UI 触发 Shizuku 授权窗口 */
+    fun requestShizuku() {
+        _uiState.update { it.copy(shizukuGrantRequested = true) }
+    }
+
+    /** Shizuku 授权结果回调（UI 调用） */
+    fun onShizukuResult(granted: Boolean) {
+        _uiState.update {
+            it.copy(
+                shizukuGrantRequested = false,
+                info = if (granted) "已获得 Shizuku 授权，联网搜索可用" else "未获得 Shizuku 授权，联网搜索不可用"
+            )
+        }
+    }
+
+    /** 是否已具备联网搜索条件（官网通道总是可用；自建 API 需 Shizuku 已授权） */
+    fun canSearchNow(): Boolean {
+        if (_uiState.value.searchEnabled) {
+            val isWeb = _uiState.value.apiProfiles.firstOrNull { it.id == _uiState.value.selectedProfileId }?.provider == "deepseek_web"
+            return isWeb || ShizukuHelper.isGranted()
+        }
+        return false
     }
 
     fun setStreaming(enabled: Boolean) {

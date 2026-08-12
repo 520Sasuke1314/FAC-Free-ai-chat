@@ -190,6 +190,8 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         thinkingEnabled: Boolean = true,
         searchEnabled: Boolean = false,
         searchProvider: String? = null,
+        webSearchPrompt: String? = null,
+        webSourcesJson: String? = null,
         imageDataUrls: List<String> = emptyList(),
         visionContext: String? = null,
         attachmentText: String? = null,

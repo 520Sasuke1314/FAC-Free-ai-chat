@@ -546,11 +546,11 @@ private fun FeedbackDialog(
     context: Context,
     onDismiss: () -> Unit
 ) {
-    val qrPainter = remember {
-        // TODO: 请将二维码图片放入 app/src/main/res/drawable/feedback_qr.jpg 或 .png
-        // 然后取消下面注释，删除 painterResource(R.drawable.feedback_qr) 前的注释
-        // painterResource(R.drawable.feedback_qr)
-        null
+    // 点击复制文案到剪贴板并提示
+    fun copyToClipboard(label: String, value: String) {
+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText(label, value))
+        android.widget.Toast.makeText(context, "已复制：$value", android.widget.Toast.LENGTH_SHORT).show()
     }
 
     AlertDialog(
@@ -570,86 +570,49 @@ private fun FeedbackDialog(
                 )
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    text = "您的反馈是我们改进的动力。请通过以下方式联系我们：",
+                    text = "欢迎加入 QQ 群交流反馈，或点击复制以下联系方式：",
                     style = MaterialTheme.typography.bodyMedium,
                     textAlign = TextAlign.Center
                 )
                 Spacer(Modifier.height(16.dp))
-                // 反馈群二维码图片
-                Box(
-                    modifier = Modifier
-                        .size(200.dp)
-                        .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(12.dp))
-                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(12.dp))
-                ) {
-                    if (qrPainter != null) {
-                        androidx.compose.ui.layout.ContentScale.Fit
-                        androidx.compose.foundation.Image(
-                            painter = qrPainter,
-                            contentDescription = "反馈群二维码",
-                            contentScale = androidx.compose.ui.layout.ContentScale.Fit,
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    } else {
-                        Column(
-                            modifier = Modifier.fillMaxSize(),
-                            verticalArrangement = Arrangement.Center,
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Icon(
-                                Icons.Filled.QrCode,
-                                contentDescription = "反馈群二维码",
-                                tint = MaterialTheme.colorScheme.outline,
-                                modifier = Modifier.size(64.dp)
-                            )
-                            Spacer(Modifier.height(8.dp))
-                            Text(
-                                "请在 res/drawable 放入 feedback_qr 图片",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.outline,
-                                textAlign = TextAlign.Center
-                            )
-                        }
-                    }
-                }
-                Spacer(Modifier.height(16.dp))
-                // 可点击邮箱
+                // QQ 群
                 Text(
-                    text = "邮箱：520susuke@gmail.com",
+                    text = "QQ 群：1101774655",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { copyToClipboard("QQ群", "1101774655") }
+                        .padding(vertical = 10.dp),
+                    textAlign = TextAlign.Center
+                )
+                HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                Spacer(Modifier.height(8.dp))
+                // 可点击复制邮箱
+                Text(
+                    text = "邮箱：520susuke@gmail.com（点击复制）",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.primary,
                     fontWeight = FontWeight.Medium,
                     textDecoration = TextDecoration.Underline,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clickable {
-                            val intent = Intent(Intent.ACTION_SENDTO).apply {
-                                data = Uri.parse("mailto:520susuke@gmail.com")
-                                putExtra(Intent.EXTRA_SUBJECT, "ChatApp 反馈")
-                            }
-                            if (intent.resolveActivity(context.packageManager) != null) {
-                                context.startActivity(intent)
-                            }
-                        }
-                        .padding(vertical = 4.dp)
+                        .clickable { copyToClipboard("邮箱", "520susuke@gmail.com") }
+                        .padding(vertical = 5.dp)
                 )
                 Spacer(Modifier.height(8.dp))
-                // 可点击 GitHub
+                // 可点击复制 GitHub
                 Text(
-                    text = "GitHub：https://github.com/520Sasuke1314/FAC-Free-ai-chat",
+                    text = "GitHub：https://github.com/520Sasuke1314/FAC-Free-ai-chat（点击复制）",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.primary,
                     fontWeight = FontWeight.Medium,
                     textDecoration = TextDecoration.Underline,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clickable {
-                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/520Sasuke1314/FAC-Free-ai-chat"))
-                            if (intent.resolveActivity(context.packageManager) != null) {
-                                context.startActivity(intent)
-                            }
-                        }
-                        .padding(vertical = 4.dp)
+                        .clickable { copyToClipboard("GitHub", "https://github.com/520Sasuke1314/FAC-Free-ai-chat") }
+                        .padding(vertical = 5.dp)
                 )
             }
         },

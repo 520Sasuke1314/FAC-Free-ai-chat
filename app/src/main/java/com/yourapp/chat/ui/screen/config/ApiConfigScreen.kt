@@ -456,28 +456,97 @@ private fun SavedModelsView(
     }
 }
 
-/** 新增 / 编辑保存模型：填模型名，勾选文本 / 识图能力 */
+/** 新增 / 编辑保存模型：填模型名，勾选文本 / 识图能力；右侧测试按钮自动获取可用模型 */
 @Composable
 private fun ModelEditorDialog(
     model: com.yourapp.chat.data.local.entity.SavedModelEntity,
     onSave: (com.yourapp.chat.data.local.entity.SavedModelEntity) -> Unit,
     onDismiss: () -> Unit
 ) {
+    val context = LocalContext.current
+    val app = ChatApplication.instance
     var name by remember { mutableStateOf(model.model) }
     var canText by remember { mutableStateOf(model.canText) }
     var canVision by remember { mutableStateOf(model.canVision) }
+    var testing by remember { mutableStateOf(false) }
+    var testResult by remember { mutableStateOf<String?>(null) }
+    var testError by remember { mutableStateOf(false) }
+    var models by remember { mutableStateOf<List<String>>(emptyList()) }
+    var showModels by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    // 从默认 API 配置拉取可用模型
+    fun fetchModels() {
+        scope.launch {
+            testing = true
+            testResult = null
+            testError = false
+            try {
+                val profile = app.apiProfileRepository.getDefault()
+                    ?: throw IllegalStateException("请先在「API 配置」中保存一个 API 配置")
+                if (profile.baseUrl.isBlank()) throw IllegalStateException("API 配置缺少 Base URL")
+                val list = ApiTester.testAndListModels(app.okHttpClient, profile.baseUrl, profile.apiKey.trim())
+                models = list
+                showModels = list.isNotEmpty()
+                testResult = if (list.isNotEmpty()) "连接成功，发现 ${list.size} 个模型" else "连接成功，但未发现模型"
+                testError = false
+                if (list.isNotEmpty() && name.isBlank()) name = list.first()
+            } catch (e: Exception) {
+                testResult = e.message ?: "测试失败"
+                testError = true
+                showModels = false
+            } finally {
+                testing = false
+            }
+        }
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(if (model.id == 0L) "添加保存模型" else "编辑保存模型") },
         text = {
-            Column {
-                OutlinedTextField(
-                    value = name,
-                    onValueChange = { name = it },
-                    label = { Text("模型名") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState())
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = {
+                            name = it
+                            showModels = false
+                        },
+                        label = { Text("模型名") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    TextButton(
+                        onClick = { fetchModels() },
+                        enabled = !testing
+                    ) { Text(if (testing) "测试中…" else "测试") }
+                }
+                testResult?.let {
+                    Text(
+                        text = it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (testError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                    )
+                }
+                if (showModels && models.isNotEmpty()) {
+                    Spacer(Modifier.height(4.dp))
+                    Text("可用模型（点击选择）：", style = MaterialTheme.typography.labelMedium)
+                    models.take(12).forEach { m ->
+                        Text(
+                            text = m,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { name = m; showModels = false }
+                                .padding(vertical = 4.dp)
+                        )
+                    }
+                }
                 Spacer(Modifier.height(12.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("文本", modifier = Modifier.weight(1f))

@@ -3,6 +3,8 @@ package com.yourapp.chat.ui.screen.chat
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import android.provider.OpenableColumns
@@ -147,6 +149,7 @@ import com.yourapp.chat.data.local.entity.MessageEntity
 import com.yourapp.chat.data.local.entity.WorldBookEntity
 import com.yourapp.chat.data.local.entity.WorldEntryEntity
 import com.yourapp.chat.data.remote.ApiTester
+import com.yourapp.chat.data.remote.ShizukuHelper
 
 /** 流式跟随阈值：视口顶部若干条以内视为「停留在生成区域」，保持平滑跟随；超过即停止跟随 */
 private const val FOLLOW_THRESHOLD = 3
@@ -245,6 +248,28 @@ fun ChatScreen(
     val conv = state.conversation
     // 是否官网免费对话（deepseek_web）：决定设置项、消息操作与时间显示
     val isWeb = state.apiProfiles.firstOrNull { it.id == state.selectedProfileId }?.provider == "deepseek_web"
+    // Shizuku 授权监听器：仅注册一次；用户点击授权后回调给 ViewModel
+    DisposableEffect(Unit) {
+        val binder = ShizukuHelper.addRequestPermissionListener { requestCode, grantResult ->
+            if (requestCode == ShizukuHelper.REQUEST_CODE) {
+                vm.onShizukuResult(grantResult == android.content.pm.PackageManager.PERMISSION_GRANTED)
+            }
+        }
+        onDispose { ShizukuHelper.removeRequestPermissionListener(binder) }
+    }
+    // 当 shizukuGrantRequested 为 true 时，尝试弹出授权窗口（只处理一次）
+    LaunchedEffect(state.shizukuGrantRequested) {
+        if (state.shizukuGrantRequested) {
+            if (!ShizukuHelper.isAvailable()) {
+                vm.onShizukuResult(false)
+                android.widget.Toast.makeText(context, "未检测到 Shizuku，请安装并启动 Shizuku 应用", android.widget.Toast.LENGTH_LONG).show()
+            } else if (!ShizukuHelper.isGranted()) {
+                ShizukuHelper.requestPermission()
+            } else {
+                vm.onShizukuResult(true)
+            }
+        }
+    }
     // 聊天页 ↔ 对话设置页：与导航页面切换相同的淡入淡出（Crossfade 交叉溶解，
     // 过渡期两层短暂共存，结束后不含残留透明层，滚动性能不受影响）
     Crossfade(
@@ -267,9 +292,6 @@ fun ChatScreen(
             onThinkingLevelChange = { vm.setThinkingLevel(it) },
             searchEnabled = state.searchEnabled,
             onSearchChange = { vm.setSearch(it) },
-            searchProvider = state.searchProvider,
-            searchEngineUrl = state.searchEngineUrl,
-            onSearchProviderClick = { vm.toggleSearchPicker() },
             currentModel = state.apiProfiles.firstOrNull { it.id == state.selectedProfileId }?.model,
             currentProfileName = state.apiProfiles.firstOrNull { it.id == state.selectedProfileId }?.name,
             apiProfiles = state.apiProfiles,
@@ -286,14 +308,6 @@ fun ChatScreen(
             injectionInterval = state.injectionInterval,
             onInjectionIntervalChange = { vm.setInjectionInterval(it) }
         )
-        if (state.showSearchPicker) {
-            SearchProviderDialog(
-                current = state.searchProvider,
-                currentUrl = state.searchEngineUrl,
-                onSelect = { p, url -> vm.selectSearchProvider(p, url) },
-                onDismiss = { vm.toggleSearchPicker() }
-            )
-        }
         if (state.showModelPicker) {
             val curProfile = state.apiProfiles.firstOrNull { it.id == state.selectedProfileId }
             SavedModelPickerDialog(
@@ -658,6 +672,37 @@ var followStream by remember { mutableStateOf(true) }
                         }
                     }
                 }
+                // 自建 API 联网搜索：显示"正在浏览网页…"
+                AnimatedVisibility(
+                    visible = state.webBrowsing,
+                    enter = expandVertically(
+                        expandFrom = androidx.compose.ui.Alignment.Top,
+                        animationSpec = tween(200)
+                    ) + fadeIn(tween(150)),
+                    exit = shrinkVertically(
+                        shrinkTowards = androidx.compose.ui.Alignment.Top,
+                        animationSpec = tween(150)
+                    ) + fadeOut(tween(150))
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        androidx.compose.material3.CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = "正在浏览网页…",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
                 HorizontalDivider()
                 if (state.attachments.isNotEmpty()) {
                     Row(
@@ -879,15 +924,6 @@ val reversedMessages = remember(state.messages) { state.messages.asReversed() }
             apiProfiles = state.apiProfiles,
             onSelect = { vm.selectModel(it) },
             onDismiss = { vm.toggleModelPicker() }
-        )
-    }
-
-    if (state.showSearchPicker) {
-        SearchProviderDialog(
-            current = state.searchProvider,
-            currentUrl = state.searchEngineUrl,
-            onSelect = { p, url -> vm.selectSearchProvider(p, url) },
-            onDismiss = { vm.toggleSearchPicker() }
         )
     }
 
@@ -1325,6 +1361,82 @@ val stripped = if (isWeb) raw.replace(ReferenceRegex, "").trim() else raw
                     }
                 }
                 // 用户消息：识图描述仅注入聊天模型上下文，不在界面显示（rikkahub OCR 思路）
+                // AI 消息：联网搜索访问的网页来源（存于 attachmentsJson，供"查看访问的网页"按钮使用）
+                if (!isUser && !message.attachmentsJson.isNullOrBlank()) {
+                    val webSources = remember(message.attachmentsJson) {
+                        runCatching {
+                            val arr = org.json.JSONArray(message.attachmentsJson)
+                            val sources = mutableListOf<Pair<String, String>>()
+                            (0 until arr.length()).forEach { i ->
+                                val o = arr.getJSONObject(i)
+                                val t = o.optString("title")
+                                val u = o.optString("url")
+                                if (t.isNotBlank() && u.isNotBlank()) sources.add(t to u)
+                            }
+                            if (sources.isNotEmpty()) sources else null
+                        }.getOrNull()
+                    }
+                    if (webSources != null) {
+                        var showSources by remember { mutableStateOf(false) }
+                        Spacer(Modifier.height(8.dp))
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { showSources = !showSources }
+                        ) {
+                            Icon(
+                                Icons.Filled.Public,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                "访问的网页 (${webSources.size})",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Spacer(Modifier.width(2.dp))
+                            Icon(
+                                if (showSources) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                        AnimatedVisibility(visible = showSources) {
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                webSources.forEach { (title, url) ->
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                                            .clickable {
+                                                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                                                if (intent.resolveActivity(context.packageManager) != null) {
+                                                    context.startActivity(intent)
+                                                }
+                                            }
+                                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(Icons.Filled.Public, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(14.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(
+                                            title,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         // 每条消息下方操作按钮（替代长按菜单）：AI 靠左、用户靠右，与文字方向一。?
@@ -1981,85 +2093,6 @@ private fun SavedModelPickerDialog(
     )
 }
 
-@Composable
-private fun SearchProviderDialog(
-    current: String,
-    currentUrl: String,
-    onSelect: (String, String) -> Unit,
-    onDismiss: () -> Unit
-) {
-    var customName by remember { mutableStateOf("") }
-    var customUrl by remember { mutableStateOf("") }
-    // 内置搜索引擎名称 -> URL 模板（{query} 会被替换为关键词。?
-val providers = listOf(
-        "bing" to "https://www.bing.com/search?q={query}",
-        "sogou" to "https://www.sogou.com/web?query={query}",
-        "360" to "https://www.so.com/s?q={query}",
-        "baidu" to "https://www.baidu.com/s?wd={query}",
-        "google" to "https://www.google.com/search?q={query}",
-        "duckduckgo" to "https://duckduckgo.com/?q={query}"
-    )
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("选择搜索引擎") },
-        text = {
-            Column {
-                providers.forEach { (p, url) ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onSelect(p, url) }
-                            .padding(vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text(p)
-                            Text(
-                                url,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.outline
-                            )
-                        }
-                        if (p == current) {
-                            Icon(Icons.Filled.Check, contentDescription = "当前", tint = MaterialTheme.colorScheme.primary)
-                        }
-                    }
-                    HorizontalDivider()
-                }
-                Text(
-                    "自定义引擎：输入名称和搜索网址，用 {query} 表示关键词位",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.outline
-                )
-                OutlinedTextField(
-                    value = customName,
-                    onValueChange = { customName = it },
-                    label = { Text("自定义引擎名") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = customUrl,
-                    onValueChange = { customUrl = it },
-                    label = { Text("搜索网址（含 {query}") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                TextButton(
-                    onClick = {
-                        if (customName.isNotBlank() && customUrl.isNotBlank() && customUrl.contains("{query}")) {
-                            onSelect(customName.trim(), customUrl.trim())
-                        }
-                    },
-                    enabled = customName.isNotBlank() && customUrl.isNotBlank() && customUrl.contains("{query}")
-                ) { Text("使用自定") }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text("取消") }
-        }
-    )
-}
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ChatSettingsPage(
@@ -2074,9 +2107,6 @@ private fun ChatSettingsPage(
     onThinkingLevelChange: (Int) -> Unit,
     searchEnabled: Boolean,
     onSearchChange: (Boolean) -> Unit,
-    searchProvider: String,
-    searchEngineUrl: String,
-    onSearchProviderClick: () -> Unit,
     currentModel: String?,
     currentProfileName: String?,
     apiProfiles: List<com.yourapp.chat.data.local.entity.ApiProfileEntity>,
@@ -2182,20 +2212,13 @@ private fun ChatSettingsPage(
                 Switch(checked = searchEnabled, onCheckedChange = onSearchChange)
             }
             // 官网免费对话：不发送搜索引擎参数，隐藏选择。?
+            // 自建 API 联网搜索固定使用 Bing，需要 Shizuku 授权
             if (!isWeb) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("搜索引擎", modifier = Modifier.weight(1f))
-                    TextButton(onClick = onSearchProviderClick) {
-                        Text("${searchProvider} · 点击切换")
-                    }
-                }
-                if (searchProvider == "custom" && searchEngineUrl.isNotBlank()) {
-                    Text(
-                        "当前搜索接口：$searchEngineUrl",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.outline
-                    )
-                }
+                Text(
+                    "自建 API 联网搜索固定使用 Bing，需要 Shizuku 授权",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.outline
+                )
             }
             // 官网免费对话的思维链由服务端控制展示，本地开关无意义，隐。?
             // 深度思考开关关闭时该行无意义（思考已禁用，也一并隐藏）
