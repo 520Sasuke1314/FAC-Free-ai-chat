@@ -13,6 +13,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -36,9 +37,13 @@ class ConversationListViewModel(
 
     init {
         viewModelScope.launch {
-            searchQuery.flatMapLatest { chatRepository.getConversationsWithLast(it) }.collect { list ->
-                _uiState.update { it.copy(conversations = list) }
-            }
+            // distinctUntilChanged：Room 任何表失效都会重跑查询，即使结果没变；
+            // 过滤重复发射，避免列表内容未变时整列无谓重组导致滑动卡顿
+            searchQuery.flatMapLatest { chatRepository.getConversationsWithLast(it) }
+                .distinctUntilChanged()
+                .collect { list ->
+                    _uiState.update { it.copy(conversations = list) }
+                }
         }
         viewModelScope.launch {
             apiProfileRepository.getAll().collect { profiles ->

@@ -36,14 +36,14 @@ class ChatRepository(
     }
 
     /**
-     * 深度思考（新版协议）对象：
-     * - 关闭：DeepSeek 官方 API 下发 {"type":"disabled"}（api.deepseek.com 只认新协议，
-     *   旧字段 thinking_enabled 会被忽略导致「关了还在思考」）；
-     * - 开启：仅 DeepSeek 官方 API 下发 {"type":"enabled"}（使默认不思考的模型显式思考）；
-     * - 其他接口一律不发送（OpenAI 等对未知参数会 400，且旧字段已由 thinking_enabled 覆盖）。
+     * 深度思考（新版协议）对象 {"type":"enabled"/"disabled"}：
+     * - DeepSeek 官方 API / DeepSeek 兼容中转站识别该字段并生效（旧字段 thinking_enabled
+     *   已被官方忽略，只发旧字段导致「关了还在思考」）；
+     * - 不识别该字段的接口（OpenAI/Claude 等）会返回 400，由 SseClient 自动回退
+     *   重试（剥离 thinking 字段）并记入黑名单，功能不受影响；
+     * - Claude 通道由 AnthropicClient 自行组包，本字段不会发出去。
      */
-    private fun buildThinkingJson(enabled: Boolean, provider: String): JsonObject? {
-        if (provider != "deepseek") return null
+    private fun buildThinkingJson(enabled: Boolean): JsonObject? {
         return JsonObject().apply { addProperty("type", if (enabled) "enabled" else "disabled") }
     }
 
@@ -304,8 +304,8 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                     // 关闭深度思考时显式下发 thinking_enabled=false；
                     // 开启时不发送该字段，避免不兼容的第三方接口报错
                     thinking_enabled = if (!thinkingEnabled) false else null,
-                    // DeepSeek 官方 API 的新协议 thinking 对象（旧字段会被官方忽略）
-                    thinking = buildThinkingJson(thinkingEnabled, cfg.provider)
+                    // 新版 thinking 协议对象（旧字段会被 DeepSeek 官方 API 忽略，双字段齐发）
+                    thinking = buildThinkingJson(thinkingEnabled)
                 )
                 streamSseReply(
                     conversationId = conversationId,
@@ -693,8 +693,8 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                     top_k = convSettings?.topK?.takeIf { it > 0 },
                     // 关闭深度思考时显式下发 thinking_enabled=false
                     thinking_enabled = if (!thinkingEnabled) false else null,
-                    // DeepSeek 官方 API 的新协议 thinking 对象（旧字段会被官方忽略）
-                    thinking = buildThinkingJson(thinkingEnabled, cfg.provider)
+                    // 新版 thinking 协议对象（旧字段会被 DeepSeek 官方 API 忽略，双字段齐发）
+                    thinking = buildThinkingJson(thinkingEnabled)
                 )
                 streamSseReply(
                     conversationId = conversationId,
@@ -836,8 +836,8 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                     top_k = convSettings?.topK?.takeIf { it > 0 },
                     // 关闭深度思考时显式下发 thinking_enabled=false
                     thinking_enabled = if (!thinkingEnabled) false else null,
-                    // DeepSeek 官方 API 的新协议 thinking 对象（旧字段会被官方忽略）
-                    thinking = buildThinkingJson(thinkingEnabled, cfg.provider)
+                    // 新版 thinking 协议对象（旧字段会被 DeepSeek 官方 API 忽略，双字段齐发）
+                    thinking = buildThinkingJson(thinkingEnabled)
                 )
                 streamSseReply(
                     conversationId = conversationId,

@@ -23,23 +23,18 @@ class SseClient(private val okHttpClient: OkHttpClient) {
         .readTimeout(60, TimeUnit.SECONDS)
         .build()
 
-    /**
-     * OpenAI 兼容的 SSE 流式对话接口。
-     * 返回的 Flow 逐段发出增量文本。
-     * @param onThinking 思考内容回调（reasoning_content 字段）
-     */
-    suspend fun chatStream(
-        baseUrl: String,
-        apiKey: String,
-        request: ChatRequest,
-        onThinking: (String) -> Unit = {}
-    ): Flow<String> = flow {
-        val jsonBody = if (request.images.isEmpty()) {
-            gson.toJson(request)
-        } else {
+    companion object {
+        /** 不识别新版 thinking 协议字段的接口（按 baseUrl 记录，首次 400 后不再携带该字段） */
+        private val thinkingUnsupported = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    }
+
+    /** 组装请求 JSON：可选剥离 thinking 字段；原生多模态时重组最后一条用户消息 */
+    private fun buildJsonBody(request: ChatRequest, includeThinking: Boolean): String {
+        val root = com.google.gson.JsonParser.parseString(gson.toJson(request)).asJsonObject
+        if (!includeThinking) root.remove("thinking")
+        if (request.images.isNotEmpty()) {
             // 原生多模态：把最后一条用户消息的 content 展开为内容数组（text + image_url）。
             // Gson 会把 images 字段序列化进去，但标准接口不认识它，需在此手动剔除并重组。
-            val root = com.google.gson.JsonParser.parseString(gson.toJson(request)).asJsonObject
             root.remove("images")
             val msgs = root.getAsJsonArray("messages")
             if (msgs.size() > 0) {
@@ -62,11 +57,29 @@ class SseClient(private val okHttpClient: OkHttpClient) {
                 }
                 last.add("content", contentArr)
             }
-            root.toString()
         }
-        val reqBody = jsonBody.toRequestBody("application/json".toMediaTypeOrNull())
-        val fullUrl = "${baseUrl.trimEnd('/')}/chat/completions"
-        val httpRequest = Request.Builder()
+        return root.toString()
+    }
+
+    /**
+     * OpenAI 兼容的 SSE 流式对话接口。
+     * 返回的 Flow 逐段发出增量文本。
+     * @param onThinking 思考内容回调（reasoning_content 字段）
+     */
+    suspend fun chatStream(
+        baseUrl: String,
+        apiKey: String,
+        request: ChatRequest,
+        onThinking: (String) -> Unit = {}
+    ): Flow<String> = flow {
+        val baseKey = baseUrl.trimEnd('/')
+        // 新版 thinking 协议字段：DeepSeek 官方/中转站识别；OpenAI 等不识别会 400，
+        // 首次请求失败后回退为不带该字段重试，并把该接口记入黑名单避免反复重试
+        var includeThinking = request.thinking != null && !thinkingUnsupported.contains(baseKey)
+        var jsonBody = buildJsonBody(request, includeThinking)
+        var reqBody = jsonBody.toRequestBody("application/json".toMediaTypeOrNull())
+        var fullUrl = "${baseKey}/chat/completions"
+        var httpRequest = Request.Builder()
             .url(fullUrl)
             .addHeader("Authorization", "Bearer $apiKey")
             .addHeader("Content-Type", "application/json")
@@ -74,8 +87,25 @@ class SseClient(private val okHttpClient: OkHttpClient) {
             .build()
         logDiag("请求 URL=$fullUrl 模型=${request.model}")
 
-        val response = withContext(Dispatchers.IO) {
+        var response = withContext(Dispatchers.IO) {
             streamingClient.newCall(httpRequest).execute()
+        }
+        if (!response.isSuccessful && (response.code == 400 || response.code == 422) && includeThinking) {
+            response.close()
+            thinkingUnsupported.add(baseKey)
+            includeThinking = false
+            jsonBody = buildJsonBody(request, includeThinking)
+            reqBody = jsonBody.toRequestBody("application/json".toMediaTypeOrNull())
+            httpRequest = Request.Builder()
+                .url(fullUrl)
+                .addHeader("Authorization", "Bearer $apiKey")
+                .addHeader("Content-Type", "application/json")
+                .post(reqBody)
+                .build()
+            logDiag("接口不识别 thinking 字段（${response.code}），已回退重试")
+            response = withContext(Dispatchers.IO) {
+                streamingClient.newCall(httpRequest).execute()
+            }
         }
         logDiag("响应码=${response.code} ${response.message}")
         if (!response.isSuccessful) {

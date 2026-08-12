@@ -1,7 +1,5 @@
 package com.yourapp.chat.ui.screen.home
 
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -16,13 +14,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import com.yourapp.chat.ui.screen.conversationlist.ConversationListScreen
@@ -35,11 +27,6 @@ enum class HomeTab(val label: String, val icon: ImageVector) {
     Settings("设置", Icons.Filled.Settings)
 }
 
-/**
- * 主界面：底部三个 Tab（对话 / 导入 / 设置）。
- * Tab 切换统一为淡入淡出（不再用 HorizontalPager 的横向滑动）。
- * tab 状态由 NavGraph 持有，从子页面返回时保持当前 Tab。
- */
 @Composable
 fun HomeScreen(
     tab: HomeTab,
@@ -50,13 +37,6 @@ fun HomeScreen(
     onOpenFavorites: () -> Unit,
     onOpenDetail: (Long) -> Unit
 ) {
-    // 每次切换 Tab 淡入一次（key=tab 触发），避免 AnimatedContent 的 measure 递归问题
-    val fade = remember(tab) { Animatable(0f) }
-    LaunchedEffect(tab) {
-        fade.snapTo(0f)
-        fade.animateTo(1f, tween(200))
-    }
-
     Scaffold(
         contentWindowInsets = WindowInsets(0.dp),
         bottomBar = {
@@ -72,11 +52,14 @@ fun HomeScreen(
             }
         }
     ) { padding ->
+        // 注意：不对内容套 graphicsLayer/alpha 淡入淡出层。整页内容一旦套上
+        // RenderNode 透明层，低端设备/软件渲染下列表每帧都要做一次离屏合成，
+        // 表现为「除对话页外所有 Tab 页滚动都卡」（对话页不在本容器内、一直流畅）。
+        // 换 Tab 改为直接切换即可。
         Box(
             Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .graphicsLayer { alpha = fade.value }
         ) {
             when (tab) {
                 HomeTab.Conversations -> ConversationListScreen(

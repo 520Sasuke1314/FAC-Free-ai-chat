@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
@@ -38,8 +39,8 @@ class FavoritesViewModel(
     init {
         viewModelScope.launch {
             combine(
-                chatRepository.getFavoriteMessages(),
-                chatRepository.getConversations()
+                chatRepository.getFavoriteMessages().distinctUntilChanged(),
+                chatRepository.getConversations().distinctUntilChanged()
             ) { messages, conversations ->
                 val titles = conversations.associate { it.id to it.title }
                 messages.map { m -> FavoriteItem(m, titles[m.conversationId] ?: "对话") }
