@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -75,6 +76,8 @@ fun ConversationListScreen(
     var searching by remember { mutableStateOf(false) }
     var searchText by remember { mutableStateOf("") }
     var renaming by remember { mutableStateOf<ConversationWithLast?>(null) }
+    // 会话列表滚动状态：让列表在置顶飞行动画之外，也具备设置页式的平滑上下滚动手感
+    val listState = rememberLazyListState()
 
     // 当前 API 摘要：通道 + 模型 + 脱敏 key，点击进 API 配置页
     val currentProfile = state.apiProfiles.firstOrNull { it.id == state.selectedProfileId }
@@ -161,6 +164,7 @@ fun ConversationListScreen(
                     .fillMaxSize()
                     .padding(padding)
                     .padding(horizontal = 16.dp),
+                state = listState,
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
@@ -216,6 +220,12 @@ private fun ConversationRow(
 ) {
     val density = LocalDensity.current
     val thresholdPx = with(density) { 80.dp.toPx() }
+
+    // —— 临时诊断：统计该行被重组的次数，滑动时若持续增长即可判定重组问题。定位后删除 ——
+    androidx.compose.runtime.SideEffect {
+        RecompDiag.count++
+        if (RecompDiag.count % 50 == 0) android.util.Log.w("RecompDiag", "总重组 ${RecompDiag.count} 次 (会话行)")
+    }
 
     // 拖动偏移动画（与收藏页完全一致）
     var dragOffset by remember { mutableStateOf(0f) }
@@ -419,3 +429,5 @@ private fun formatTime(ts: Long): String {
         else -> DateFmt.format(Date(ts))
     }
 }
+
+object RecompDiag { var count = 0 }

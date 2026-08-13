@@ -3,6 +3,8 @@ package com.yourapp.chat.data.remote
 import com.google.gson.Gson
 import com.yourapp.chat.data.remote.model.ChatRequest
 import com.yourapp.chat.data.remote.model.ChatResponse
+import com.yourapp.chat.data.remote.model.ToolCall
+import com.yourapp.chat.data.remote.model.ToolCallFunction
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -65,12 +67,14 @@ class SseClient(private val okHttpClient: OkHttpClient) {
      * OpenAI 兼容的 SSE 流式对话接口。
      * 返回的 Flow 逐段发出增量文本。
      * @param onThinking 思考内容回调（reasoning_content 字段）
+     * @param onToolCall 工具调用回调：流式过程中累积到完整工具调用参数时触发
      */
     suspend fun chatStream(
         baseUrl: String,
         apiKey: String,
         request: ChatRequest,
-        onThinking: (String) -> Unit = {}
+        onThinking: (String) -> Unit = {},
+        onToolCall: (ToolCall) -> Unit = {}
     ): Flow<String> = flow {
         val baseKey = baseUrl.trimEnd('/')
         // 新版 thinking 协议字段：DeepSeek 官方/中转站识别；OpenAI 等不识别会 400，
@@ -117,6 +121,9 @@ class SseClient(private val okHttpClient: OkHttpClient) {
         // 是否发出了任何内容（思考或正文）；是否发出了非空白正文
         var emitted = false
         var bodyEmitted = false
+        // 工具调用累积（按工具 id 分片合并，null 时沿用上一个 id）
+        val toolCalls = LinkedHashMap<String, MutableList<ToolCallFragment>>()
+        var lastToolKey = ""
         // 原始响应累积，用于非流式 JSON 兜底 & 空响应时把真实返回抛给上层诊断
         val rawBody = StringBuilder()
         // 无正文保护：接口可能持续返回 data 帧（空 delta / role 帧 / 心跳），
@@ -163,6 +170,14 @@ class SseClient(private val okHttpClient: OkHttpClient) {
                                     reasoning.append(reasoningText)
                                     onThinking(reasoningText)
                                 }
+                                // 累积工具调用：流式片段按到达顺序归入 bucket。
+                                // 同一工具调用多次分片用同一 key；不同调用以非空 id 为界新开 bucket。
+                                (delta?.tool_calls ?: choice.message?.tool_calls)?.forEach { tc ->
+                                    val key = tc.id ?: (lastToolKey)
+                                    lastToolKey = key
+                                    val fragments = toolCalls.getOrPut(key) { ArrayList() }
+                                    fragments.add(ToolCallFragment(tc))
+                                }
                                 contentText?.let { content ->
                                     // 不再在 SseClient 层面注入 [思考] 标签，由上层统一处理
                                     // 这样保持与官网通道一致：thinking 通过 onThinking 回调，正文通过 emit
@@ -185,7 +200,8 @@ class SseClient(private val okHttpClient: OkHttpClient) {
                         if (lineCount % 50 == 0) { }
                         // 无正文保护：思考中（有 reasoning）给 120s，否则 25s。
                         // 达到时限仍无正文 → 中断并抛错，避免界面永远显示省略号。
-                        if (!bodyEmitted) {
+                        // 工具调用流只发 delta.tool_calls 不含正文，故有工具调用时跳过该保护。
+                        if (!bodyEmitted && toolCalls.isEmpty()) {
                             val limit = if (reasoning.isNotEmpty()) 120_000L else 25_000L
                             if (System.currentTimeMillis() - startedAt > limit) {
                                 val snippet = rawBody.toString().trim().take(800)
@@ -207,6 +223,16 @@ class SseClient(private val okHttpClient: OkHttpClient) {
         // 优化：批量推送剩余的累积内容
         if (accumulatedContent.isNotEmpty()) {
             emit(accumulatedContent.toString())
+        }
+        // 合并工具调用分片并回调（工具调用与正文互斥：出现工具调用即意味着要执行工具，
+        // 上层据此运行 search_web 并把结果回填，再二次请求模型生成最终答案）
+        if (toolCalls.isNotEmpty()) {
+            toolCalls.values.forEach { frags ->
+                val merged = mergeFragments(frags)
+                if (merged.function.name != null) onToolCall(merged)
+            }
+            // 工具调用触发时不应再走"无正文"报错路径
+            if (!bodyEmitted) bodyEmitted = true
         }
         // 非流式兜底：兼容忽略 stream=true 直接返回完整 JSON 的服务
         // （Ollama / 中转站等），覆盖整段 JSON、美化打印 JSON、每行一个 JSON 三种情况
@@ -270,5 +296,30 @@ class SseClient(private val okHttpClient: OkHttpClient) {
         } catch (e: Exception) {
             null
         }
+    }
+
+    /** 工具调用在流式中的分片（同一 index 的多个 delta 需合并） */
+    private data class ToolCallFragment(
+        val id: String?,
+        val type: String?,
+        val name: String?,
+        val arguments: String?
+    ) {
+        constructor(tc: ToolCall) : this(tc.id, tc.type, tc.function.name, tc.function.arguments)
+    }
+
+    /** 把同一次工具调用的多个分片合并为完整 ToolCall */
+    private fun mergeFragments(frags: List<ToolCallFragment>): ToolCall {
+        var id: String? = null
+        var type: String? = null
+        var name: String? = null
+        val args = StringBuilder()
+        frags.forEach { f ->
+            if (f.id != null) id = f.id
+            if (f.type != null) type = f.type
+            if (f.name != null) name = f.name
+            if (f.arguments != null) args.append(f.arguments)
+        }
+        return ToolCall(id = id, type = type, function = ToolCallFunction(name = name, arguments = args.toString()))
     }
 }

@@ -1,5 +1,6 @@
 package com.yourapp.chat.data.repository
 
+import android.util.Log
 import com.yourapp.chat.data.local.AppDatabase
 import com.yourapp.chat.data.local.entity.ApiProfileEntity
 import com.yourapp.chat.data.local.entity.CharacterCardEntity
@@ -9,8 +10,14 @@ import com.yourapp.chat.data.remote.ApiService
 import com.yourapp.chat.data.remote.DeepSeekWebClient
 import com.yourapp.chat.data.remote.AnthropicClient
 import com.yourapp.chat.data.remote.SseClient
+import com.yourapp.chat.data.remote.PhoneWebSearch
+import com.yourapp.chat.data.remote.WebSearchResult
 import com.yourapp.chat.data.remote.model.ChatRequest
 import com.yourapp.chat.data.remote.model.Message
+import com.yourapp.chat.data.remote.model.ToolCall
+import com.yourapp.chat.data.remote.model.ToolCallFunction
+import com.yourapp.chat.data.remote.model.ToolDef
+import com.yourapp.chat.data.remote.model.ToolFunctionDef
 import com.google.gson.JsonObject
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -33,6 +40,7 @@ class ChatRepository(
     companion object {
         /** 注入频率：每 N 句对话注入一次世界信息（减少 token 占用，同时保证设定新鲜度） */
         const val INJECTION_INTERVAL = 25
+        private const val TAG = "ChatRepo"
     }
 
     /**
@@ -54,11 +62,11 @@ class ChatRepository(
     }
 
     /** 按 profile 协议分派到 OpenAI 兼容或 Anthropic 原生流式客户端 */
-    private suspend fun chatStream(cfg: ApiProfileEntity, request: ChatRequest, onThinking: (String) -> Unit = {}) =
+    private suspend fun chatStream(cfg: ApiProfileEntity, request: ChatRequest, onThinking: (String) -> Unit = {}, onToolCall: (ToolCall) -> Unit = {}) =
         if (cfg.protocol == "anthropic" && cfg.provider != "deepseek_web") {
             anthropicClient.chatStream(cfg.baseUrl, cfg.apiKey, request, onThinking)
         } else {
-            sseClient.chatStream(cfg.baseUrl, cfg.apiKey, request, onThinking)
+            sseClient.chatStream(cfg.baseUrl, cfg.apiKey, request, onThinking, onToolCall)
         }
 
     /**
@@ -190,6 +198,7 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         thinkingEnabled: Boolean = true,
         searchEnabled: Boolean = false,
         searchProvider: String? = null,
+        customEngineUrl: String? = null,
         webSearchPrompt: String? = null,
         webSourcesJson: String? = null,
         imageDataUrls: List<String> = emptyList(),
@@ -301,9 +310,14 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                 )
             } else {
                 val convSettings = getConversation(conversationId)
+                // 自建 API 联网搜索：把手机端搜索到的网页结果作为 system 消息注入请求，
+                // 否则模型看不到搜索结果，联网搜索等于没生效
+                val requestMessagesWithWeb = if (!webSearchPrompt.isNullOrBlank()) {
+                    finalMessages + Message(role = "system", content = webSearchPrompt)
+                } else finalMessages
                 val request = ChatRequest(
                     model = cfg.model,
-                    messages = finalMessages,
+                    messages = requestMessagesWithWeb,
                     stream = true,
                     temperature = convSettings?.temperature?.takeIf { it >= 0 },
                     max_tokens = convSettings?.maxOutputTokens?.takeIf { it > 0 },
@@ -314,8 +328,12 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                     // 开启时不发送该字段，避免不兼容的第三方接口报错
                     thinking_enabled = if (!thinkingEnabled) false else null,
                     // 新版 thinking 协议对象（旧字段会被 DeepSeek 官方 API 忽略，双字段齐发）
-                    thinking = buildThinkingJson(thinkingEnabled)
+                    thinking = buildThinkingJson(thinkingEnabled),
+                    // 联网搜索：让模型自主决定是否搜索（OpenAI 兼容 function calling）。
+                    // 若接口不支持 tools，SseClient 的 onToolCall 不会触发，回退为关键词注入（见上 webSearchPrompt）。
+                    tools = if (searchEnabled && cfg.protocol != "anthropic" && cfg.provider != "deepseek_web") buildSearchTool() else null
                 )
+                Log.d(TAG, ">>> 请求模型=${cfg.model} protocol=${cfg.protocol} provider=${cfg.provider} searchEnabled=$searchEnabled tools=${if (request.tools != null) "SET(${request.tools.size})" else "null"}流式走 streamSseReply")
                 streamSseReply(
                     conversationId = conversationId,
                     cfg = cfg,
@@ -323,6 +341,10 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                     assistantId = assistantId,
                     assistantParentId = userMsgId,
                     sb = sb,
+                    webSourcesJson = webSourcesJson,
+                    searchProvider = searchProvider,
+                    customEngineUrl = customEngineUrl,
+                    searchEnabled = searchEnabled,
                     onToken = onToken,
                     onContent = onContent,
                     onThinking = onThinking
@@ -505,6 +527,10 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         assistantId: Long,
         assistantParentId: Long?,
         sb: StringBuilder,
+        webSourcesJson: String? = null,
+        searchProvider: String? = null,
+        customEngineUrl: String? = null,
+        searchEnabled: Boolean = false,
         onToken: (String) -> Unit,
         onContent: (String) -> Unit,
         onThinking: (String) -> Unit = {}
@@ -518,30 +544,112 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         var lastUiPush = 0L
         var lastThinkPush = 0L
         var thinkingText = StringBuilder()
+        // 工具搜索命中的结果，用于写入消息 sources（"浏览/访问的网页"）；需在 try 之外以便异常分支复用
+        val toolSources = ArrayList<WebSearchResult>()
         try {
-        chatStream(cfg, request, onThinking = { t ->
-            thinkingText.append(t)
-            // 思考链按刷新频率节流推送（思考逐段增长，UI 单独展示）
-            val now = System.currentTimeMillis()
-            if (now - lastThinkPush >= pushInterval) {
-                onThinking(thinkingText.toString())
-                lastThinkPush = now
-            }
-        }).collect { token ->
-            sb.append(token)
-            onToken(token)
-            if (streaming) {
-                val now = System.currentTimeMillis()
-                // 节流推送正文（间隔由设置页「刷新频率」控制），避免每 token 触发 UI 重组导致 CPU 飙升
-                if (now - lastUiPush >= pushInterval) {
-                    onContent(sb.toString())
-                    lastUiPush = now
+            // —— 联网搜索（函数调用）循环 ——
+            // 参考 RikkaHub：把 search_web 工具交给模型，让它自主决定是否搜索；
+            // 模型发出工具调用 → 我们执行搜索 → 把结果作为 tool 消息回填 → 再次请求生成最终答案。
+            // 兼容两种工具调用形式：
+            //  1) 原生 JSON delta.tool_calls（OpenAI 兼容，经 onToolCall 回调）
+            //  2) 文本式 <tool_call>search_web\n<arg_key>query</arg_key>\n<arg_value>...</arg_value></tool_call>（部分中转站/模型把工具调用以纯文本流式吐出）
+            var currentRequest = request
+            var pendingSearch: String? = null            // 待执行的搜索词（文本式工具调用解析所得）
+            var toolResult: Pair<ToolCall, String>? = null   // (原生工具调用, 搜索结果提示)
+            var round = 0
+            while (true) {
+                var capturedToolCall: ToolCall? = null
+                // 记录本轮是否收到过文本式工具调用
+                var textToolSeen = false
+                chatStream(cfg, currentRequest, onThinking = { t ->
+                    thinkingText.append(t)
+                    val now = System.currentTimeMillis()
+                    if (now - lastThinkPush >= pushInterval) {
+                        onThinking(thinkingText.toString())
+                        lastThinkPush = now
+                    }
+                }, onToolCall = { tc ->
+                    if (capturedToolCall == null && tc.function.name == "search_web") {
+                        capturedToolCall = tc
+                        Log.d(TAG, "检测到原生工具调用 search_web: ${tc.function.arguments}")
+                    }
+                }).collect { token ->
+                    sb.append(token)
+                    // 文本式工具调用检测：出现 search_web 标记即命中（query 在 <arg_value> 中，从原始文本解析）
+                    if (round == 0 && !textToolSeen) {
+                        if (token.contains("<tool_call>", ignoreCase = true)) {
+                            textToolSeen = true
+                            Log.d(TAG, "检测到文本式工具调用标记，token 开头: ${token.take(120)}")
+                        }
+                    }
+                    onToken(token)
+                    if (streaming) {
+                        val now = System.currentTimeMillis()
+                        if (now - lastUiPush >= pushInterval) {
+                            onContent(sb.toString())
+                            lastUiPush = now
+                        }
+                    }
                 }
+                // 1) 原生工具调用优先
+                var tc = capturedToolCall
+                var query: String? = null
+                if (tc != null) {
+                    query = extractSearchQuery(tc.function.arguments)
+                }
+                // 2) 否则尝试文本式工具调用（从本轮原始文本解析 <arg_value>）
+                if (tc == null && textToolSeen) {
+                    val q = parseTextToolQuery(sb.toString())
+                    if (q != null) {
+                        tc = ToolCall(id = "search_web_${System.currentTimeMillis()}", function = ToolCallFunction(name = "search_web", arguments = "{\"query\":\"$q\"}"))
+                        query = q
+                        Log.d(TAG, "文本式工具调用解析到 query='$q'")
+                    }
+                }
+                if (tc == null || query.isNullOrBlank() || round >= 2) {
+                    Log.d(TAG, "工具循环退出: tc=${tc != null}, query='$query', textToolSeen=$textToolSeen, round=$round")
+                    break
+                }
+                // 执行联网搜索
+                Log.d(TAG, "开始执行联网搜索: query='$query'")
+                val (results, errMsg) = try {
+                    PhoneWebSearch.search(query, limit = 5, engine = searchProvider ?: "bing", customEngineUrl = customEngineUrl) to null
+                } catch (e: Exception) {
+                    emptyList<WebSearchResult>() to (e.message ?: "搜索请求失败")
+                }
+                Log.d(TAG, "搜索完成: 结果数=${results.size}, errMsg='$errMsg'")
+                val resultPrompt = if (results.isNotEmpty()) {
+                    toolSources.addAll(results)
+                    PhoneWebSearch.buildPrompt(query, results)
+                } else {
+                    "【联网搜索】没有找到与「$query」相关的结果${errMsg?.let { "（$it）" } ?: ""}。请基于已有知识回答，或请用户补充信息。"
+                }
+                toolResult = tc to resultPrompt
+                // 追加 assistant(带 tool_calls) + tool(结果) 后再次请求，让模型基于结果作答
+                val assistantToolMsg = Message(
+                    role = "assistant",
+                    content = null,
+                    tool_calls = listOf(tc)
+                )
+                val toolMsg = Message(
+                    role = "tool",
+                    content = resultPrompt,
+                    tool_call_id = tc.id,
+                    name = tc.function.name
+                )
+                currentRequest = currentRequest.copy(
+                    messages = currentRequest.messages + assistantToolMsg + toolMsg,
+                    tools = null
+                )
+                round++
             }
-        }
-        val finalContent = if (thinkingText.isNotEmpty()) "[思考]${thinkingText}[/思考]\n\n$sb" else sb.toString()
+        val cleanSb = sb.toString().replace(Regex("<tool_call>(.*?)</tool_call>", RegexOption.DOT_MATCHES_ALL), "")
+            .trim()
+        val finalContent = if (thinkingText.isNotEmpty()) "[思考]${thinkingText}[/思考]\n\n$cleanSb" else cleanSb
         if (thinkingText.isNotEmpty()) onThinking(thinkingText.toString())
         onContent(finalContent)
+        // 工具搜索命中的结果优先作为"访问的网页"来源；否则沿用传入的 webSourcesJson
+        val effectiveSources = if (toolSources.isNotEmpty()) PhoneWebSearch.buildSourcesJson(toolSources) else webSourcesJson
         db.messageDao().update(
             MessageEntity(
                 id = assistantId,
@@ -549,7 +657,8 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                 role = "assistant",
                 content = finalContent,
                 timestamp = originalTimestamp ?: System.currentTimeMillis(),
-                parentMessageId = assistantParentId
+                parentMessageId = assistantParentId,
+                attachmentsJson = effectiveSources
             )
         )
     } catch (e: Exception) {
@@ -566,13 +675,68 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                     role = "assistant",
                     content = partial,
                     timestamp = originalTimestamp ?: System.currentTimeMillis(),
-                    parentMessageId = assistantParentId
+                    parentMessageId = assistantParentId,
+                    attachmentsJson = if (toolSources.isNotEmpty()) PhoneWebSearch.buildSourcesJson(toolSources) else webSourcesJson
                 )
             )
         }
         throw e
     }
 }
+
+    /** 从 search_web 工具的 JSON arguments 里提取 query 字段 */
+    private fun extractSearchQuery(arguments: String?): String {
+        if (arguments.isNullOrBlank()) return ""
+        return try {
+            val obj = org.json.JSONObject(arguments)
+            obj.optString("query").trim()
+        } catch (e: Exception) {
+            // 部分实现直接返回裸字符串 query
+            arguments.trim().removeSurrounding("\"").trim()
+        }
+    }
+
+    /**
+     * 从累积的文本式工具调用内容里解析出 query 词。
+     * 文本式工具调用形如：
+     *   <tool_call>search_web\n<arg_key>query</arg_key>\n<arg_value>抖音鸽子神</arg_value></tool_call>
+     */
+    private fun parseTextToolQuery(accumulated: String): String? {
+        val t = accumulated.trim()
+        if (t.isBlank()) return null
+        // 优先取 <arg_value> 值
+        Regex("<arg_value>(.*?)</arg_value>", RegexOption.DOT_MATCHES_ALL)
+            .find(t)?.let { m ->
+                val v = m.groupValues[1].trim()
+                if (v.isNotBlank()) return v
+            }
+        // 兜底：去掉标签后的纯文本
+        val stripped = t.replace(Regex("<[^>]+>"), "").trim()
+        return stripped.ifBlank { null }
+    }
+
+    /** 构造 search_web 工具定义（OpenAI 兼容 JSON Schema） */
+    private fun buildSearchTool(): List<ToolDef> {
+        val params = com.google.gson.JsonObject()
+        params.addProperty("type", "object")
+        val props = com.google.gson.JsonObject()
+        val q = com.google.gson.JsonObject()
+        q.addProperty("type", "string")
+        q.addProperty("description", "要搜索的关键词或问题，应尽量简短精炼")
+        props.add("query", q)
+        params.add("properties", props)
+        val required = com.google.gson.JsonArray().apply { add("query") }
+        params.add("required", required)
+        return listOf(
+            ToolDef(
+                function = ToolFunctionDef(
+                    name = "search_web",
+                    description = "当你需要获取最新、实时、或外部网络信息（如新闻、天气、价格、人物/事件、百科知识、比赛比分等）来回答用户问题时，调用此工具进行联网搜索。搜索结果会作为资料供你引用。",
+                    parameters = params
+                )
+            )
+        )
+    }
 
 /**
  * SSE 流式回复写入：节流写库（默认每 120ms），结束前必定落盘。
@@ -877,6 +1041,30 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
             }
             onError(e)
         }
+    }
+
+    /**
+     * 本地编辑一条 assistant（AI）消息的内容并保存。
+     * 与 editUserMessage 不同：只改动该条 AI 回复本身的文本，不触发重新生成，
+     * 之后的对话会以编辑后的 AI 内容作为记忆/上下文。
+     */
+    suspend fun editAssistantMessage(
+        conversationId: Long,
+        messageId: Long,
+        newThinking: String?,
+        newContent: String
+    ) {
+        if (newContent.isBlank()) return
+        val target = db.messageDao().getById(messageId) ?: return
+        if (target.role != "assistant") return
+        val finalContent = when {
+            newThinking.isNullOrBlank() -> newContent
+            else -> "[思考]${newThinking}[/思考]\n\n${newContent}"
+        }
+        db.messageDao().update(target.copy(content = finalContent))
+        db.conversationDao().update(
+            getConversation(conversationId)?.copy(updatedAt = System.currentTimeMillis()) ?: return
+        )
     }
 
     /**

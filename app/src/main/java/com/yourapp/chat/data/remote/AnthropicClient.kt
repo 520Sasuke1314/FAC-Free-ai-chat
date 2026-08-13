@@ -147,14 +147,14 @@ class AnthropicClient(private val okHttpClient: OkHttpClient) {
         request.temperature?.takeIf { it >= 0 }?.let { root.addProperty("temperature", it) }
         request.top_p?.takeIf { it >= 0 }?.let { root.addProperty("top_p", it) }
         // 提取 system 角色 → 顶层 system 字段；其余进 messages
-        val system = request.messages.filter { it.role == "system" }.joinToString("\n") { it.content }
+        val system = request.messages.filter { it.role == "system" }.joinToString("\n") { it.content.orEmpty() }
             .takeIf { it.isNotBlank() }
         system?.let { root.addProperty("system", it) }
         val msgs = com.google.gson.JsonArray()
         request.messages.filter { it.role != "system" }.forEach { m ->
             val obj = JsonObject()
             obj.addProperty("role", if (m.role == "assistant") "assistant" else "user")
-            obj.addProperty("content", m.content)
+            obj.addProperty("content", m.content.orEmpty())
             msgs.add(obj)
         }
         root.add("messages", msgs)

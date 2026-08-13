@@ -18,5 +18,6 @@ data class Choice(
 data class Delta(
     val role: String?,
     val content: String?,
-    val reasoning_content: String? = null
+    val reasoning_content: String? = null,
+    val tool_calls: List<ToolCall>? = null
 )

@@ -482,9 +482,11 @@ private fun ModelEditorDialog(
             testResult = null
             testError = false
             try {
-                val profile = app.apiProfileRepository.getDefault()
+                // 用该模型所属的 API 配置测试（而不是默认配置），确保已保存的 Base URL 生效
+                val profile = app.apiProfileRepository.getById(model.apiProfileId)
+                    ?: app.apiProfileRepository.getDefault()
                     ?: throw IllegalStateException("请先在「API 配置」中保存一个 API 配置")
-                if (profile.baseUrl.isBlank()) throw IllegalStateException("API 配置缺少 Base URL")
+                if (profile.baseUrl.isBlank()) throw IllegalStateException("API 配置缺少 Base URL，请先填写")
                 val list = ApiTester.testAndListModels(app.okHttpClient, profile.baseUrl, profile.apiKey.trim())
                 models = list
                 showModels = list.isNotEmpty()

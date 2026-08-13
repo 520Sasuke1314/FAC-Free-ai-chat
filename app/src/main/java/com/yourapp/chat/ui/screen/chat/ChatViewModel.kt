@@ -215,7 +215,9 @@ class ChatViewModel(
         _uiState.update { it.copy(inputText = "", isSending = true, error = null, streamingContent = null, streamingThinking = null, injectionNotice = null) }
         // 思考力度：非官网用滑块（0=不思考；自动/1-5=思考，自动交给模型决定力度）；官网免费用开关
         val thinking = resolveThinking()
-        val search = _uiState.value.searchEnabled
+        // 联网搜索开关（已移除 UI，功能默认关闭）+ 自动识别"需要联网搜"的表述。
+        // 因 UI 开关已删除且功能默认关闭，这里固定不联网，仅保留逻辑代码。
+        val search = false
         val provider = _uiState.value.searchProvider
         val isWebChannel = profile.provider == "deepseek_web"
         // 自建 API 联网搜索需要 Shizuku 授权：未授权则弹出授权窗口并中止本次发送
@@ -234,11 +236,11 @@ class ChatViewModel(
                 if (search && !isWebChannel) {
                     _uiState.update { it.copy(webBrowsing = true) }
                     try {
-                        val results = PhoneWebSearch.search(text, limit = 5)
+                        val results = PhoneWebSearch.search(text, limit = 5, engine = provider, customEngineUrl = _uiState.value.searchEngineUrl)
                         if (results.isEmpty()) {
                             _uiState.update { it.copy(info = "没有搜索到相关网页，将直接回答") }
                         } else {
-                            webSearchPrompt = PhoneWebSearch.buildPrompt(results)
+                            webSearchPrompt = PhoneWebSearch.buildPrompt(text, results)
                             webSourcesJson = PhoneWebSearch.buildSourcesJson(results)
                         }
                     } catch (e: Exception) {
@@ -308,6 +310,7 @@ class ChatViewModel(
                     thinkingEnabled = thinking,
                     searchEnabled = search,
                     searchProvider = provider,
+                    customEngineUrl = _uiState.value.searchEngineUrl,
                     webSearchPrompt = webSearchPrompt,
                     webSourcesJson = webSourcesJson,
                     imageDataUrls = imageDataUrls,
@@ -466,6 +469,18 @@ class ChatViewModel(
                 persistLastUsedProfile()
             } catch (e: kotlinx.coroutines.CancellationException) {
                 persistPartialToDb()
+            } catch (e: Exception) {
+                _uiState.update { it.copy(error = e.message, isSending = false, streamingContent = null, streamingThinking = null) }
+            }
+        }
+    }
+
+    /** 编辑 AI 回复：仅本地修改并保存该条 AI 文本，供后续对话作为记忆/上下文；不触发重新生成 */
+    fun editAssistantMessage(messageId: Long, thinking: String?, newContent: String) {
+        viewModelScope.launch {
+            try {
+                chatRepository.editAssistantMessage(conversationId, messageId, thinking, newContent)
+                _uiState.update { it.copy(info = "已保存 AI 回复修改") }
             } catch (e: Exception) {
                 _uiState.update { it.copy(error = e.message, isSending = false, streamingContent = null, streamingThinking = null) }
             }
@@ -883,6 +898,37 @@ class ChatViewModel(
                 it.copy(info = if (favorite) "已收藏" else "已取消收藏")
             }
         }
+    }
+
+    /**
+     * 判断用户本轮表述是否"隐含联网搜索需求"。命中即自动触发本次联网搜索，
+     * 无需用户手动打开搜索开关。关键词匹配到「搜索/查找」类动词，或「XX 是什么/什么意思/
+     * 怎么了/新闻/为什么/多少钱/天气预报/股票 等需要实时或外部信息的表述」。
+     */
+    private fun isSearchIntent(input: String): Boolean {
+        val t = input.trim()
+        if (t.isBlank()) return false
+        // 搜索类动词（含引申）
+        val searchVerbs = listOf(
+            "搜索", "搜一", "搜一下", "搜搜", "查一下", "查查", "查一", "查找", "查询", "搜",
+            "百度", "谷歌", "google", "bing", "上网搜", "帮你搜", "帮我搜",
+            "查一下", "查下", "搜索一下", "搜出来"
+        )
+        // 问"某某是什么/什么意思"等需要百科/实时信息的问题
+        val questionPatterns = listOf(
+            "是什么", "什么是", "啥是", "怎么回", "怎么了", "为什么", "为何", "在哪",
+            "在哪里", "哪个", "多少钱", "价格", "最新", "今天", "现在", "近日", "新闻",
+            "时事", "天气预报", "天气", "股票", "汇率", "油价", "足球", "比赛", "比分"
+        )
+        val lower = t.lowercase()
+        val hasSearchVerb = searchVerbs.any { t.contains(it) }
+        val hasQuestion = questionPatterns.any { t.contains(it) }
+        // 单纯闲聊式提问（如「你今天好吗」）不应触发搜索：排除太短/过于口语的普通问候
+        if (!hasSearchVerb && !hasQuestion) return false
+        // 排除明显的非搜索闲聊，避免误触发
+        val casual = listOf("你好", "再见", "谢谢", "请问你好", "你是谁", "你能做什么")
+        if (casual.any { t.contains(it) }) return false
+        return lower.length > 1
     }
 
     companion object {

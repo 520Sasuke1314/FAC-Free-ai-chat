@@ -13,8 +13,8 @@ android {
         applicationId = "com.yourapp.chat"
         minSdk = 24
         targetSdk = 34
-        versionCode = 6
-        versionName = "1.0.6"
+        versionCode = 7
+        versionName = "1.0.8"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
     }
@@ -83,6 +83,8 @@ dependencies {
 
     // Shizuku：用于授予联网搜索权限（通过 Shizuku 在手机上执行网页搜索）
     implementation("dev.rikka.shizuku:api:13.1.5")
+    // ShizukuProvider：联网搜索必须的 Binder 接收组件（缺少会导致"未检测到 Shizuku"）
+    implementation("dev.rikka.shizuku:provider:13.1.5")
 
     // Testing
     testImplementation("junit:junit:4.13.2")

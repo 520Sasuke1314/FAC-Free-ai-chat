@@ -126,11 +126,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.produceState
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.mapLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlin.math.roundToInt
 import kotlin.math.cos
 import kotlin.math.sin
@@ -290,8 +295,6 @@ fun ChatScreen(
             onThinkingChange = { vm.setThinking(it) },
             thinkingLevel = state.thinkingLevel,
             onThinkingLevelChange = { vm.setThinkingLevel(it) },
-            searchEnabled = state.searchEnabled,
-            onSearchChange = { vm.setSearch(it) },
             currentModel = state.apiProfiles.firstOrNull { it.id == state.selectedProfileId }?.model,
             currentProfileName = state.apiProfiles.firstOrNull { it.id == state.selectedProfileId }?.name,
             apiProfiles = state.apiProfiles,
@@ -343,35 +346,47 @@ fun ChatScreen(
         return@Crossfade
     }
 
-    // 使用 derivedStateOf 优化流式内容解析，避免每帧重新计算正。?    // 思考链已与正文分开展示：优先取 streamingThinking；非流式/旧数据时回退解析拼接内容
+    // 流式内容解析：参考 RikkaHub 的平滑流式做法——把正则解析放到后台线程，
+    // 用 mapLatest 只在拿到最新内容时计算一次（可取消地跳过中间帧），再在后台线程合并重复值，
+    // 避免每帧在主线程跑正则导致掉帧。返回 Pair(思考文本, 正文文本)。
     // 注意：与完成态保持同一套 trim 规则——生成中与完成后文本逐字符一致，
     // 完成后切换数据源时气泡高度零变化，不会"弹跳"。
-    val streamingThinkingContent by remember(state) {
-        derivedStateOf {
-            state.streamingThinking?.trim()?.takeIf { it.isNotBlank() }
-                ?: state.streamingContent?.let { content ->
-                    ThinkingBlockRegex.findAll(content)
-                        .map { it.groupValues[2].trim() }
-                        .filter { it.isNotBlank() }
-                        .joinToString("\n")
-                        .ifBlank { null }
+    val streamingParsed by produceState<Pair<String?, String>>(
+        initialValue = null to (state.streamingContent?.let {
+            if (isWeb) it.replace(ReferenceRegex, "").trim().ifBlank { "…" }
+            else it.replace(ThinkingBlockRegex, "").trim().ifBlank { "…" }
+        } ?: "…")
+    ) {
+        snapshotFlow { state.streamingThinking to state.streamingContent }
+            .mapLatest { (thinking, content) ->
+                // 思考文本：优先用单独推送的 streamingThinking；否则从拼接内容里解析思考块
+                val thinkingText = thinking?.trim()?.takeIf { it.isNotBlank() }
+                    ?: content?.let { c ->
+                        ThinkingBlockRegex.findAll(c)
+                            .map { it.groupValues[2].trim() }
+                            .filter { it.isNotBlank() }
+                            .joinToString("\n")
+                            .ifBlank { null }
+                    }
+                val bodyText = if (content == null) "…" else {
+                    if (isWeb) {
+                        // 官网：正文保留思考文本（完成态同样不剥离），仅剥离来源标注 + trim，与完成态逐字一致
+                        content.replace(ReferenceRegex, "").trim().ifBlank { "…" }
+                    } else if (thinking != null) {
+                        // 思考已单独推送，content 为纯正文（剥离思考块 + trim，与完成态一致）
+                        content.replace(ThinkingBlockRegex, "").trim().ifBlank { "…" }
+                    } else {
+                        content.replace(ThinkingBlockRegex, "").trim().ifEmpty { "…" }
+                    }
                 }
-        }
-    }
-
-    val streamingBodyContent by remember(state) {
-        derivedStateOf {
-            if (isWeb) {
-                // 官网：正文保留思考文本（完成态同样不剥离），仅剥离来源标注 + trim，与完成态逐字一致
-                state.streamingContent?.let { it.replace(ReferenceRegex, "").trim().ifBlank { "…" } }
-            } else if (state.streamingThinking != null) {
-                // 思考已单独推送，streamingContent 为纯正文（剥离思考块 + trim，与完成态一致）
-                state.streamingContent?.let { it.replace(ThinkingBlockRegex, "").trim().ifBlank { "…" } }
-            } else {
-                state.streamingContent?.let { it.replace(ThinkingBlockRegex, "").trim().ifEmpty { "…" } }
+                thinkingText to bodyText
             }
-        }
+            .flowOn(Dispatchers.Default)
+            .distinctUntilChanged()
+            .collect { value = it }
     }
+    val streamingThinkingContent by remember { derivedStateOf { streamingParsed.first } }
+    val streamingBodyContent by remember { derivedStateOf { streamingParsed.second } }
 
     // —。?右侧搜索/定位面板状。?—。?
 val scope = rememberCoroutineScope()
@@ -928,14 +943,31 @@ val reversedMessages = remember(state.messages) { state.messages.asReversed() }
     }
 
     editingMessage?.let { target ->
-        EditMessageDialog(
-            initialText = target.content,
-            onDismiss = { editingMessage = null },
-            onConfirm = { newText ->
-                editingMessage = null
-                vm.editUserMessage(target.id, newText)
-            }
-        )
+        if (target.role == "assistant") {
+            // 编辑 AI 回复：仅改本条 AI 文本并保存，供后续对话作为记忆/上下文，不触发重新生成
+            val raw = target.content
+            val thinking = ThinkingBlockRegex.find(raw)?.groupValues?.get(2)?.trim()?.takeIf { it.isNotBlank() }
+            val body = if (isWeb) raw.trim() else raw.replace(ThinkingBlockRegex, "").trim()
+            EditMessageDialog(
+                initialText = body,
+                isUser = false,
+                onDismiss = { editingMessage = null },
+                onConfirm = { newText ->
+                    editingMessage = null
+                    vm.editAssistantMessage(target.id, thinking, newText)
+                }
+            )
+        } else {
+            EditMessageDialog(
+                initialText = target.content,
+                isUser = true,
+                onDismiss = { editingMessage = null },
+                onConfirm = { newText ->
+                    editingMessage = null
+                    vm.editUserMessage(target.id, newText)
+                }
+            )
+        }
     }
     
     // 分支选择器（回溯用）：包含用户与 AI 消息
@@ -964,18 +996,19 @@ val reversedMessages = remember(state.messages) { state.messages.asReversed() }
 @Composable
 private fun EditMessageDialog(
     initialText: String,
+    isUser: Boolean,
     onDismiss: () -> Unit,
     onConfirm: (String) -> Unit
 ) {
     var text by remember { mutableStateOf(initialText) }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("编辑消息") },
+        title = { Text(if (isUser) "编辑消息" else "编辑 AI 回复") },
         text = {
             OutlinedTextField(
                 value = text,
                 onValueChange = { text = it },
-                label = { Text("编辑后 AI 将重新回复") },
+                label = { Text(if (isUser) "编辑后 AI 将重新回复" else "修改后保存为 AI 的回复内容") },
                 modifier = Modifier.fillMaxWidth()
             )
         },
@@ -983,7 +1016,7 @@ private fun EditMessageDialog(
             TextButton(
                 onClick = { onConfirm(text.trim()) },
                 enabled = text.isNotBlank()
-            ) { Text("确认并重新生") }
+            ) { Text(if (isUser) "确认并重新生成" else "保存修改") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("取消") }
@@ -2105,8 +2138,6 @@ private fun ChatSettingsPage(
     onThinkingChange: (Boolean) -> Unit,
     thinkingLevel: Int,
     onThinkingLevelChange: (Int) -> Unit,
-    searchEnabled: Boolean,
-    onSearchChange: (Boolean) -> Unit,
     currentModel: String?,
     currentProfileName: String?,
     apiProfiles: List<com.yourapp.chat.data.local.entity.ApiProfileEntity>,
@@ -2207,19 +2238,6 @@ private fun ChatSettingsPage(
                 }
             }
             Spacer(Modifier.height(8.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("联网搜索", modifier = Modifier.weight(1f))
-                Switch(checked = searchEnabled, onCheckedChange = onSearchChange)
-            }
-            // 官网免费对话：不发送搜索引擎参数，隐藏选择。?
-            // 自建 API 联网搜索固定使用 Bing，需要 Shizuku 授权
-            if (!isWeb) {
-                Text(
-                    "自建 API 联网搜索固定使用 Bing，需要 Shizuku 授权",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.outline
-                )
-            }
             // 官网免费对话的思维链由服务端控制展示，本地开关无意义，隐。?
             // 深度思考开关关闭时该行无意义（思考已禁用，也一并隐藏）
             if (!isWeb && thinkingEnabled) {
