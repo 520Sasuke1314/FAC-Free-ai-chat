@@ -23,6 +23,7 @@ captures/
 .cxx/
 
 # Backups / temp
+backup/
 *.bak
 *.pre_recover.bak
 *.orig

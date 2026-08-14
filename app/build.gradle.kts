@@ -22,6 +22,7 @@ android {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {
@@ -80,11 +81,6 @@ dependencies {
 
     // Coil
     implementation("io.coil-kt:coil-compose:2.5.0")
-
-    // Shizuku：用于授予联网搜索权限（通过 Shizuku 在手机上执行网页搜索）
-    implementation("dev.rikka.shizuku:api:13.1.5")
-    // ShizukuProvider：联网搜索必须的 Binder 接收组件（缺少会导致"未检测到 Shizuku"）
-    implementation("dev.rikka.shizuku:provider:13.1.5")
 
     // Testing
     testImplementation("junit:junit:4.13.2")

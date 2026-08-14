@@ -3,17 +3,21 @@ package com.yourapp.chat.ui.screen.world
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.draw.clip
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
@@ -45,11 +49,27 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.yourapp.chat.data.local.entity.WorldBookEntity
 import com.yourapp.chat.data.local.entity.WorldEntryEntity
+
+// 多本世界书同时展开时，每本书分配独立强调色，让各书条目视觉上分区，避免混叠在一起
+private val worldBookAccentPalette = listOf(
+    Color(0xFF7C4DFF), // 紫
+    Color(0xFF26A69A), // 青
+    Color(0xFFEF6C00), // 橙
+    Color(0xFF43A047), // 绿
+    Color(0xFFE53935), // 红
+    Color(0xFF1E88E5)  // 蓝
+)
+
+private fun worldBookAccent(bookId: Long): Color {
+    val idx = Math.floorMod(bookId, worldBookAccentPalette.size.toLong()).toInt()
+    return worldBookAccentPalette[idx]
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -119,7 +139,7 @@ fun WorldListScreen(onBack: () -> Unit, showBack: Boolean = true) {
                     )
                 }
             }
-            items(state.books, key = { it.id }) { book ->
+            items(state.books, key = { "book_${it.id}" }) { book ->
                 WorldBookCardHeader(
                     book = book,
                     loaded = state.entriesByBook.containsKey(book.id),
@@ -136,18 +156,43 @@ fun WorldListScreen(onBack: () -> Unit, showBack: Boolean = true) {
             state.books.forEach { book ->
                 if (state.expandedBookIds.contains(book.id)) {
                     val entries = state.entriesByBook[book.id].orEmpty()
+                    // 每本书的条目组前加分区标头（书名 + 本书强调色），多书展开时清楚区分归属
+                    item(key = "book_entries_header_${book.id}") {
+                        val accent = worldBookAccent(book.id)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = 24.dp, top = 6.dp, bottom = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .width(3.dp)
+                                    .height(14.dp)
+                                    .background(accent)
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                "${book.name} · 条目",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = accent
+                            )
+                        }
+                    }
                     if (entries.isEmpty()) {
                         item(key = "book_empty_${book.id}") {
                             Text(
                                 "该世界书没有条目",
-                                modifier = Modifier.padding(horizontal = 24.dp, vertical = 10.dp),
+                                modifier = Modifier.padding(start = 24.dp, end = 24.dp, top = 2.dp, bottom = 8.dp),
                                 style = MaterialTheme.typography.bodySmall
                             )
                         }
                     } else {
-                        items(entries, key = { it.id }) { entry ->
+                        items(entries, key = { "book_entry_${it.id}" }) { entry ->
                             ExpandedEntryRow(
                                 entry = entry,
+                                bookId = book.id,
+                                accent = worldBookAccent(book.id),
                                 onDelete = { vm.delete(entry) },
                                 onEdit = { vm.openEdit(entry) }
                             )
@@ -166,7 +211,7 @@ fun WorldListScreen(onBack: () -> Unit, showBack: Boolean = true) {
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                     )
                 }
-                items(state.manualEntries, key = { it.id }) { entry ->
+                items(state.manualEntries, key = { "manual_${it.id}" }) { entry ->
                     ManualEntryRow(
                         entry = entry,
                         onDelete = { vm.delete(entry) },
@@ -218,7 +263,7 @@ private fun WorldBookCardHeader(
                     .padding(12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(Icons.Filled.MenuBook, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                Icon(Icons.Filled.FileUpload, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
                     Text(book.name, style = MaterialTheme.typography.titleSmall)
@@ -287,34 +332,58 @@ private fun RenameBookDialog(
 @Composable
 private fun ExpandedEntryRow(
     entry: WorldEntryEntity,
+    bookId: Long,
+    accent: Color,
     onDelete: () -> Unit,
     onEdit: () -> Unit
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onEdit)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+            .padding(start = 20.dp, end = 12.dp, top = 2.dp, bottom = 2.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Column(Modifier.weight(1f)) {
-            Text(
-                text = entry.keys,
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.primary
-            )
-            Text(
-                text = entry.content,
-                style = MaterialTheme.typography.bodySmall,
-                maxLines = 2
-            )
-        }
-        // 移除导入页面的开关，世界书在对话中由用户手动选择启用
-        IconButton(onClick = onDelete) {
-            Icon(Icons.Filled.Delete, contentDescription = "删除条目")
+        // 左侧竖条 + 缩进：让条目明显"隶属于"其所属世界书，多个书展开时不会混在一起
+        Box(
+            modifier = Modifier
+                .width(3.dp)
+                .height(40.dp)
+                .background(accent.copy(alpha = 0.45f))
+        )
+        Spacer(Modifier.width(10.dp))
+        Surface(
+            modifier = Modifier
+                .weight(1f)
+                .clip(MaterialTheme.shapes.medium)
+                .clickable(onClick = onEdit),
+            shape = MaterialTheme.shapes.medium,
+            color = MaterialTheme.colorScheme.surfaceVariant
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        text = entry.keys,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(Modifier.width(0.dp).padding(top = 2.dp))
+                    Text(
+                        text = entry.content,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 3
+                    )
+                }
+                IconButton(onClick = onDelete) {
+                    Icon(Icons.Filled.Delete, contentDescription = "删除条目")
+                }
+            }
         }
     }
-    HorizontalDivider(Modifier.padding(start = 12.dp))
 }
 
 @Composable
@@ -323,31 +392,38 @@ private fun ManualEntryRow(
     onDelete: () -> Unit,
     onEdit: () -> Unit
 ) {
-    Row(
+    Surface(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onEdit)
-            .padding(12.dp),
-        verticalAlignment = Alignment.CenterVertically
+            .padding(horizontal = 12.dp, vertical = 4.dp),
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceVariant
     ) {
-        Column(Modifier.weight(1f)) {
-            Text(
-                text = entry.keys,
-                style = MaterialTheme.typography.titleSmall,
-                color = MaterialTheme.colorScheme.primary
-            )
-            Text(
-                text = entry.content,
-                style = MaterialTheme.typography.bodySmall,
-                maxLines = 2
-            )
-        }
-        // 移除导入页面的开关，世界书在对话中由用户手动选择启用
-        IconButton(onClick = onDelete) {
-            Icon(Icons.Filled.Delete, contentDescription = "删除")
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onEdit)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = entry.keys,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.width(0.dp).padding(top = 2.dp))
+                Text(
+                    text = entry.content,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 3
+                )
+            }
+            IconButton(onClick = onDelete) {
+                Icon(Icons.Filled.Delete, contentDescription = "删除")
+            }
         }
     }
-    HorizontalDivider()
 }
 
 @Composable

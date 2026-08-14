@@ -47,7 +47,7 @@ class CharacterCardRepository(
 
         // 保存图片副本（PNG 时）
         val imagePath: String? = if (isPng(bytes)) {
-            val dir = File(context.filesDir, "cards").apply { mkdirs() }
+            val dir = File(context.filesDir, "media/cards").apply { mkdirs() }
             val dest = File(dir, "${data.name}_${System.currentTimeMillis()}.png")
             dest.writeBytes(bytes)
             dest.absolutePath

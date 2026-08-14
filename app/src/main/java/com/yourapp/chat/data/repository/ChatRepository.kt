@@ -10,15 +10,10 @@ import com.yourapp.chat.data.remote.ApiService
 import com.yourapp.chat.data.remote.DeepSeekWebClient
 import com.yourapp.chat.data.remote.AnthropicClient
 import com.yourapp.chat.data.remote.SseClient
-import com.yourapp.chat.data.remote.PhoneWebSearch
-import com.yourapp.chat.data.remote.WebSearchResult
 import com.yourapp.chat.data.remote.model.ChatRequest
 import com.yourapp.chat.data.remote.model.Message
-import com.yourapp.chat.data.remote.model.ToolCall
-import com.yourapp.chat.data.remote.model.ToolCallFunction
-import com.yourapp.chat.data.remote.model.ToolDef
-import com.yourapp.chat.data.remote.model.ToolFunctionDef
 import com.google.gson.JsonObject
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
@@ -62,11 +57,11 @@ class ChatRepository(
     }
 
     /** 按 profile 协议分派到 OpenAI 兼容或 Anthropic 原生流式客户端 */
-    private suspend fun chatStream(cfg: ApiProfileEntity, request: ChatRequest, onThinking: (String) -> Unit = {}, onToolCall: (ToolCall) -> Unit = {}) =
+    private suspend fun chatStream(cfg: ApiProfileEntity, request: ChatRequest, onThinking: (String) -> Unit = {}) =
         if (cfg.protocol == "anthropic" && cfg.provider != "deepseek_web") {
             anthropicClient.chatStream(cfg.baseUrl, cfg.apiKey, request, onThinking)
         } else {
-            sseClient.chatStream(cfg.baseUrl, cfg.apiKey, request, onThinking, onToolCall)
+            sseClient.chatStream(cfg.baseUrl, cfg.apiKey, request, onThinking)
         }
 
     /**
@@ -198,9 +193,6 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         thinkingEnabled: Boolean = true,
         searchEnabled: Boolean = false,
         searchProvider: String? = null,
-        customEngineUrl: String? = null,
-        webSearchPrompt: String? = null,
-        webSourcesJson: String? = null,
         imageDataUrls: List<String> = emptyList(),
         visionContext: String? = null,
         attachmentText: String? = null,
@@ -231,37 +223,28 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         val conversation = getConversation(conversationId)
         // 构造请求消息（包含刚插入的 user 消息），按最大上下文消息数截断历史
         val limitedHistory = applyMaxContext(history, conversation?.maxContextMessages ?: 0)
-        val requestMessages = limitedHistory.filter { it.role != "system" || it.content.isNotBlank() }
-            .map { Message(it.role, it.content) } + Message("user", userContent)
+        val requestBase = limitedHistory.filter { it.role != "system" || it.content.isNotBlank() }
+            .map { Message(it.role, it.content) }
+        // 识图结果直接植入本条用户消息（带前缀），使模型把描述当作该消息本身的内容，而非独立的 system 提示。
+        val embeddedUserContent = if (!visionContext.isNullOrBlank()) {
+            "$userContent\n\n这是一张用户发来的图片，里面所包含的内容：\n$visionContext"
+        } else userContent
+        val requestMessages = requestBase + Message("user", embeddedUserContent)
 
         // 世界书注入：按对话开关加载 角色卡世界书 + 全局世界书，仅注入轮次才附加（每 25 句一次），
         // 始终只作为请求中的 system 消息发送给 AI，不写入数据库，故对用户不可见。
         val turnIndex = history.count { it.role == "user" } + 1
-        val matchedWorld = if (isInjectionTurn(turnIndex, conversation?.injectionInterval ?: 25)) {
+        val shouldInject = isInjectionTurn(turnIndex, conversation?.injectionInterval ?: 25)
+        val matchedWorld = if (shouldInject) {
             buildMatchedWorldInfo(conversation, userContent)
         } else emptyList()
         val persona = configRepo.getPersona().trim()
         
-        // 注入提示
-        if (matchedWorld.isNotEmpty()) {
-            onInjectionNotice("已注入世界书信息（${matchedWorld.size} 条）")
-        }
-        if (persona.isNotEmpty()) {
-            onInjectionNotice("已注入用户设定")
-        }
-        // 角色卡注入提示
-        if (conversation?.useCharacterCard == true && conversation?.characterCardId != null) {
-            val card = conversation?.characterCardId?.let { db.characterCardDao().getById(it) }
-            card?.let { onInjectionNotice("已注入角色卡：${it.name}") }
-        }
-        
-        val finalMessages = if (matchedWorld.isNotEmpty() || persona.isNotEmpty() || !visionContext.isNullOrBlank() || !attachmentText.isNullOrBlank()) {
+        val finalMessages = if (shouldInject || !attachmentText.isNullOrBlank()) {
             val worldBlock = matchedWorld.joinToString("\n\n").take(6000)
-            val personaBlock = if (persona.isNotEmpty()) {
+            // 只有在注入轮次时才加入用户设定（节省缓存 token）
+            val personaBlock = if (shouldInject && persona.isNotEmpty()) {
                 "【用户设定】这是与你对话的用户的自定义设定，请始终遵守：\n$persona"
-            } else ""
-            val visionBlock = if (!visionContext.isNullOrBlank()) {
-                "以下是用户本次所附图片的内容描述，请结合图片内容回答问题：\n$visionContext"
             } else ""
             val attachmentBlock = if (!attachmentText.isNullOrBlank()) {
                 "以下是用户本次上传的文件内容，请结合内容回答（与当前对话无关时可忽略）：\n$attachmentText"
@@ -269,10 +252,10 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
             val block = listOfNotNull(
                 worldBlock.takeIf { it.isNotEmpty() }?.let { "以下是当前场景的世界信息，请融入对话：\n$it" },
                 personaBlock.takeIf { it.isNotEmpty() },
-                visionBlock.takeIf { it.isNotEmpty() },
                 attachmentBlock.takeIf { it.isNotEmpty() }
             ).joinToString("\n\n")
-            requestMessages + Message(role = "system", content = block)
+            if (block.isBlank()) requestMessages
+            else requestMessages + Message(role = "system", content = block)
         } else requestMessages
 
         // 插入 assistant 占位消息
@@ -295,7 +278,7 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                 // 让模型在回答前先读到角色与场景设定（这是角色卡/世界书生效的关键）。
                 streamWebReply(
                     conversationId = conversationId,
-                    prompt = buildWebPrompt(conversation, userContent, matchedWorld, attachmentText),
+                    prompt = buildWebPrompt(conversation, userContent, matchedWorld, attachmentText, shouldInject),
                     assistantId = assistantId,
                     assistantParentId = userMsgId,
                     parentOverride = null,
@@ -310,14 +293,9 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                 )
             } else {
                 val convSettings = getConversation(conversationId)
-                // 自建 API 联网搜索：把手机端搜索到的网页结果作为 system 消息注入请求，
-                // 否则模型看不到搜索结果，联网搜索等于没生效
-                val requestMessagesWithWeb = if (!webSearchPrompt.isNullOrBlank()) {
-                    finalMessages + Message(role = "system", content = webSearchPrompt)
-                } else finalMessages
                 val request = ChatRequest(
                     model = cfg.model,
-                    messages = requestMessagesWithWeb,
+                    messages = finalMessages,
                     stream = true,
                     temperature = convSettings?.temperature?.takeIf { it >= 0 },
                     max_tokens = convSettings?.maxOutputTokens?.takeIf { it > 0 },
@@ -328,12 +306,8 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                     // 开启时不发送该字段，避免不兼容的第三方接口报错
                     thinking_enabled = if (!thinkingEnabled) false else null,
                     // 新版 thinking 协议对象（旧字段会被 DeepSeek 官方 API 忽略，双字段齐发）
-                    thinking = buildThinkingJson(thinkingEnabled),
-                    // 联网搜索：让模型自主决定是否搜索（OpenAI 兼容 function calling）。
-                    // 若接口不支持 tools，SseClient 的 onToolCall 不会触发，回退为关键词注入（见上 webSearchPrompt）。
-                    tools = if (searchEnabled && cfg.protocol != "anthropic" && cfg.provider != "deepseek_web") buildSearchTool() else null
+                    thinking = buildThinkingJson(thinkingEnabled)
                 )
-                Log.d(TAG, ">>> 请求模型=${cfg.model} protocol=${cfg.protocol} provider=${cfg.provider} searchEnabled=$searchEnabled tools=${if (request.tools != null) "SET(${request.tools.size})" else "null"}流式走 streamSseReply")
                 streamSseReply(
                     conversationId = conversationId,
                     cfg = cfg,
@@ -341,10 +315,6 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                     assistantId = assistantId,
                     assistantParentId = userMsgId,
                     sb = sb,
-                    webSourcesJson = webSourcesJson,
-                    searchProvider = searchProvider,
-                    customEngineUrl = customEngineUrl,
-                    searchEnabled = searchEnabled,
                     onToken = onToken,
                     onContent = onContent,
                     onThinking = onThinking
@@ -371,23 +341,26 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         conversation: ConversationEntity?,
         userContent: String,
         matchedWorld: List<String>,
-        attachmentText: String? = null
+        attachmentText: String? = null,
+        isInjectionTurn: Boolean = false
     ): String {
         val card = conversation?.characterCardId?.let { db.characterCardDao().getById(it) }
         val worldPrefix = matchedWorld.joinToString("\n\n").take(6000)
         val persona = configRepo.getPersona().trim()
         return buildString {
-            // 只有启用角色卡注入时才加入角色设定
-            if (conversation?.useCharacterCard == true) {
-                card?.systemPrompt?.takeIf { it.isNotBlank() }?.let { sys ->
-                    append("【角色设定】你正在扮演角色「${card.name}」。\n$sys\n\n")
+            // 只有在注入轮次时才加入角色卡设定和用户设定（节省缓存 token）
+            if (isInjectionTurn) {
+                if (conversation?.useCharacterCard == true) {
+                    card?.systemPrompt?.takeIf { it.isNotBlank() }?.let { sys ->
+                        append("【角色设定】你正在扮演角色「${card.name}」。\n$sys\n\n")
+                    }
+                }
+                if (persona.isNotEmpty()) {
+                    append("【用户设定】这是与你对话的用户的自定义设定，请始终遵守：\n$persona\n\n")
                 }
             }
             if (worldPrefix.isNotEmpty()) {
                 append("【世界信息】\n$worldPrefix\n\n")
-            }
-            if (persona.isNotEmpty()) {
-                append("【用户设定】这是与你对话的用户的自定义设定，请始终遵守：\n$persona\n\n")
             }
             val attachText = attachmentText?.trim()
             if (!attachText.isNullOrEmpty()) {
@@ -407,6 +380,7 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         assistantId: Long,
         assistantParentId: Long?,
         parentOverride: Long?,
+        editMessageId: Long? = null,
         thinkingEnabled: Boolean,
         searchEnabled: Boolean,
         searchProvider: String?,
@@ -439,6 +413,23 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                     onThinking = { t ->
                         thinkingText.append(t)
                         // 思考链按刷新频率节流推送（思考逐段增长，UI 单独展示）
+                        val now = System.currentTimeMillis()
+                        if (now - lastThinkPush >= pushInterval) {
+                            onThinking(thinkingText.toString())
+                            lastThinkPush = now
+                        }
+                    }
+                )
+            } else if (editMessageId != null) {
+                // 官网编辑消息：专用 /api/v0/chat/edit_message 端点，用官方 message_id 原地替换该用户消息
+                webRepo.editMessageStream(
+                    conversationId = conversationId,
+                    messageId = editMessageId,
+                    prompt = prompt,
+                    thinkingEnabled = thinkingEnabled,
+                    searchEnabled = searchEnabled,
+                    onThinking = { t ->
+                        thinkingText.append(t)
                         val now = System.currentTimeMillis()
                         if (now - lastThinkPush >= pushInterval) {
                             onThinking(thinkingText.toString())
@@ -527,10 +518,6 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         assistantId: Long,
         assistantParentId: Long?,
         sb: StringBuilder,
-        webSourcesJson: String? = null,
-        searchProvider: String? = null,
-        customEngineUrl: String? = null,
-        searchEnabled: Boolean = false,
         onToken: (String) -> Unit,
         onContent: (String) -> Unit,
         onThinking: (String) -> Unit = {}
@@ -544,112 +531,28 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         var lastUiPush = 0L
         var lastThinkPush = 0L
         var thinkingText = StringBuilder()
-        // 工具搜索命中的结果，用于写入消息 sources（"浏览/访问的网页"）；需在 try 之外以便异常分支复用
-        val toolSources = ArrayList<WebSearchResult>()
         try {
-            // —— 联网搜索（函数调用）循环 ——
-            // 参考 RikkaHub：把 search_web 工具交给模型，让它自主决定是否搜索；
-            // 模型发出工具调用 → 我们执行搜索 → 把结果作为 tool 消息回填 → 再次请求生成最终答案。
-            // 兼容两种工具调用形式：
-            //  1) 原生 JSON delta.tool_calls（OpenAI 兼容，经 onToolCall 回调）
-            //  2) 文本式 <tool_call>search_web\n<arg_key>query</arg_key>\n<arg_value>...</arg_value></tool_call>（部分中转站/模型把工具调用以纯文本流式吐出）
-            var currentRequest = request
-            var pendingSearch: String? = null            // 待执行的搜索词（文本式工具调用解析所得）
-            var toolResult: Pair<ToolCall, String>? = null   // (原生工具调用, 搜索结果提示)
-            var round = 0
-            while (true) {
-                var capturedToolCall: ToolCall? = null
-                // 记录本轮是否收到过文本式工具调用
-                var textToolSeen = false
-                chatStream(cfg, currentRequest, onThinking = { t ->
-                    thinkingText.append(t)
+            chatStream(cfg, request, onThinking = { t ->
+                thinkingText.append(t)
+                val now = System.currentTimeMillis()
+                if (now - lastThinkPush >= pushInterval) {
+                    onThinking(thinkingText.toString())
+                    lastThinkPush = now
+                }
+            }).collect { token ->
+                sb.append(token)
+                onToken(token)
+                if (streaming) {
                     val now = System.currentTimeMillis()
-                    if (now - lastThinkPush >= pushInterval) {
-                        onThinking(thinkingText.toString())
-                        lastThinkPush = now
-                    }
-                }, onToolCall = { tc ->
-                    if (capturedToolCall == null && tc.function.name == "search_web") {
-                        capturedToolCall = tc
-                        Log.d(TAG, "检测到原生工具调用 search_web: ${tc.function.arguments}")
-                    }
-                }).collect { token ->
-                    sb.append(token)
-                    // 文本式工具调用检测：出现 search_web 标记即命中（query 在 <arg_value> 中，从原始文本解析）
-                    if (round == 0 && !textToolSeen) {
-                        if (token.contains("<tool_call>", ignoreCase = true)) {
-                            textToolSeen = true
-                            Log.d(TAG, "检测到文本式工具调用标记，token 开头: ${token.take(120)}")
-                        }
-                    }
-                    onToken(token)
-                    if (streaming) {
-                        val now = System.currentTimeMillis()
-                        if (now - lastUiPush >= pushInterval) {
-                            onContent(sb.toString())
-                            lastUiPush = now
-                        }
+                    if (now - lastUiPush >= pushInterval) {
+                        onContent(sb.toString())
+                        lastUiPush = now
                     }
                 }
-                // 1) 原生工具调用优先
-                var tc = capturedToolCall
-                var query: String? = null
-                if (tc != null) {
-                    query = extractSearchQuery(tc.function.arguments)
-                }
-                // 2) 否则尝试文本式工具调用（从本轮原始文本解析 <arg_value>）
-                if (tc == null && textToolSeen) {
-                    val q = parseTextToolQuery(sb.toString())
-                    if (q != null) {
-                        tc = ToolCall(id = "search_web_${System.currentTimeMillis()}", function = ToolCallFunction(name = "search_web", arguments = "{\"query\":\"$q\"}"))
-                        query = q
-                        Log.d(TAG, "文本式工具调用解析到 query='$q'")
-                    }
-                }
-                if (tc == null || query.isNullOrBlank() || round >= 2) {
-                    Log.d(TAG, "工具循环退出: tc=${tc != null}, query='$query', textToolSeen=$textToolSeen, round=$round")
-                    break
-                }
-                // 执行联网搜索
-                Log.d(TAG, "开始执行联网搜索: query='$query'")
-                val (results, errMsg) = try {
-                    PhoneWebSearch.search(query, limit = 5, engine = searchProvider ?: "bing", customEngineUrl = customEngineUrl) to null
-                } catch (e: Exception) {
-                    emptyList<WebSearchResult>() to (e.message ?: "搜索请求失败")
-                }
-                Log.d(TAG, "搜索完成: 结果数=${results.size}, errMsg='$errMsg'")
-                val resultPrompt = if (results.isNotEmpty()) {
-                    toolSources.addAll(results)
-                    PhoneWebSearch.buildPrompt(query, results)
-                } else {
-                    "【联网搜索】没有找到与「$query」相关的结果${errMsg?.let { "（$it）" } ?: ""}。请基于已有知识回答，或请用户补充信息。"
-                }
-                toolResult = tc to resultPrompt
-                // 追加 assistant(带 tool_calls) + tool(结果) 后再次请求，让模型基于结果作答
-                val assistantToolMsg = Message(
-                    role = "assistant",
-                    content = null,
-                    tool_calls = listOf(tc)
-                )
-                val toolMsg = Message(
-                    role = "tool",
-                    content = resultPrompt,
-                    tool_call_id = tc.id,
-                    name = tc.function.name
-                )
-                currentRequest = currentRequest.copy(
-                    messages = currentRequest.messages + assistantToolMsg + toolMsg,
-                    tools = null
-                )
-                round++
             }
-        val cleanSb = sb.toString().replace(Regex("<tool_call>(.*?)</tool_call>", RegexOption.DOT_MATCHES_ALL), "")
-            .trim()
-        val finalContent = if (thinkingText.isNotEmpty()) "[思考]${thinkingText}[/思考]\n\n$cleanSb" else cleanSb
+        val finalContent = if (thinkingText.isNotEmpty()) "[思考]${thinkingText}[/思考]\n\n$sb" else sb.toString()
         if (thinkingText.isNotEmpty()) onThinking(thinkingText.toString())
         onContent(finalContent)
-        // 工具搜索命中的结果优先作为"访问的网页"来源；否则沿用传入的 webSourcesJson
-        val effectiveSources = if (toolSources.isNotEmpty()) PhoneWebSearch.buildSourcesJson(toolSources) else webSourcesJson
         db.messageDao().update(
             MessageEntity(
                 id = assistantId,
@@ -657,8 +560,7 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                 role = "assistant",
                 content = finalContent,
                 timestamp = originalTimestamp ?: System.currentTimeMillis(),
-                parentMessageId = assistantParentId,
-                attachmentsJson = effectiveSources
+                parentMessageId = assistantParentId
             )
         )
     } catch (e: Exception) {
@@ -675,68 +577,13 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                     role = "assistant",
                     content = partial,
                     timestamp = originalTimestamp ?: System.currentTimeMillis(),
-                    parentMessageId = assistantParentId,
-                    attachmentsJson = if (toolSources.isNotEmpty()) PhoneWebSearch.buildSourcesJson(toolSources) else webSourcesJson
+                    parentMessageId = assistantParentId
                 )
             )
         }
         throw e
     }
 }
-
-    /** 从 search_web 工具的 JSON arguments 里提取 query 字段 */
-    private fun extractSearchQuery(arguments: String?): String {
-        if (arguments.isNullOrBlank()) return ""
-        return try {
-            val obj = org.json.JSONObject(arguments)
-            obj.optString("query").trim()
-        } catch (e: Exception) {
-            // 部分实现直接返回裸字符串 query
-            arguments.trim().removeSurrounding("\"").trim()
-        }
-    }
-
-    /**
-     * 从累积的文本式工具调用内容里解析出 query 词。
-     * 文本式工具调用形如：
-     *   <tool_call>search_web\n<arg_key>query</arg_key>\n<arg_value>抖音鸽子神</arg_value></tool_call>
-     */
-    private fun parseTextToolQuery(accumulated: String): String? {
-        val t = accumulated.trim()
-        if (t.isBlank()) return null
-        // 优先取 <arg_value> 值
-        Regex("<arg_value>(.*?)</arg_value>", RegexOption.DOT_MATCHES_ALL)
-            .find(t)?.let { m ->
-                val v = m.groupValues[1].trim()
-                if (v.isNotBlank()) return v
-            }
-        // 兜底：去掉标签后的纯文本
-        val stripped = t.replace(Regex("<[^>]+>"), "").trim()
-        return stripped.ifBlank { null }
-    }
-
-    /** 构造 search_web 工具定义（OpenAI 兼容 JSON Schema） */
-    private fun buildSearchTool(): List<ToolDef> {
-        val params = com.google.gson.JsonObject()
-        params.addProperty("type", "object")
-        val props = com.google.gson.JsonObject()
-        val q = com.google.gson.JsonObject()
-        q.addProperty("type", "string")
-        q.addProperty("description", "要搜索的关键词或问题，应尽量简短精炼")
-        props.add("query", q)
-        params.add("properties", props)
-        val required = com.google.gson.JsonArray().apply { add("query") }
-        params.add("required", required)
-        return listOf(
-            ToolDef(
-                function = ToolFunctionDef(
-                    name = "search_web",
-                    description = "当你需要获取最新、实时、或外部网络信息（如新闻、天气、价格、人物/事件、百科知识、比赛比分等）来回答用户问题时，调用此工具进行联网搜索。搜索结果会作为资料供你引用。",
-                    parameters = params
-                )
-            )
-        )
-    }
 
 /**
  * SSE 流式回复写入：节流写库（默认每 120ms），结束前必定落盘。
@@ -769,7 +616,8 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         val userContent = userMsg?.content ?: ""
         val conversation = getConversation(conversationId)
         val turnIndex = all.count { it.role == "user" && it.timestamp <= (userMsg?.timestamp ?: target.timestamp) }
-        val matchedWorld = if (isInjectionTurn(turnIndex, conversation?.injectionInterval ?: 25)) {
+        val shouldInject = isInjectionTurn(turnIndex, conversation?.injectionInterval ?: 25)
+        val matchedWorld = if (shouldInject) {
             buildMatchedWorldInfo(conversation, userContent)
         } else emptyList()
 
@@ -785,17 +633,6 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
             )
         )
         val sb = StringBuilder()
-        
-        // 注入提示
-        if (matchedWorld.isNotEmpty()) {
-            onInjectionNotice("已注入世界书信息（${matchedWorld.size} 条）")
-        }
-        val persona = configRepo.getPersona().trim()
-        // 角色卡注入提示
-        if (conversation?.useCharacterCard == true && conversation?.characterCardId != null) {
-            val card = conversation?.characterCardId?.let { db.characterCardDao().getById(it) }
-            card?.let { onInjectionNotice("已注入角色卡：${it.name}") }
-        }
         
         try {
             if (cfg.provider == "deepseek_web") {
@@ -815,7 +652,7 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                 if (childId != null) {
                     streamWebReply(
                         conversationId = conversationId,
-                        prompt = buildWebPrompt(conversation, userContent, matchedWorld),
+                        prompt = buildWebPrompt(conversation, userContent, matchedWorld, null, shouldInject),
                         assistantId = assistantId,
                         assistantParentId = userMsg?.id,
                         parentOverride = null,
@@ -831,7 +668,7 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                 } else {
                     streamWebReply(
                         conversationId = conversationId,
-                        prompt = buildWebPrompt(conversation, userContent, matchedWorld),
+                        prompt = buildWebPrompt(conversation, userContent, matchedWorld, null, shouldInject),
                         assistantId = assistantId,
                         assistantParentId = userMsg?.id,
                         parentOverride = null,
@@ -902,8 +739,9 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
 
     /**
      * 编辑：长按用户消息 → 修改文本，AI 按编辑后的文本重新回答。
-     * 官网路径：编辑后的文本作 prompt，parent 用编辑消息之前那条消息的官网 id（首条则 null）。
+     * 官网路径：先删除官网原消息及其后续（best-effort），再用编辑内容替换该位置。
      * 本地：删除该用户消息及后续，插入编辑后的用户消息 + 占位 assistant。
+     * @return 官网原消息分支是否已删除（非官网通道返回 false）
      */
     suspend fun editUserMessage(
         conversationId: Long,
@@ -919,8 +757,8 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         thinkingEnabled: Boolean = true,
         searchEnabled: Boolean = false,
         searchProvider: String? = null
-    ) {
-        if (newContent.isBlank()) return
+    ): Boolean {
+        if (newContent.isBlank()) return false
         val cfg = profile ?: apiProfileRepo?.getDefault()
             ?: configRepo.getConfig()?.let { ApiProfileEntity(provider = "custom", name = "旧配置", baseUrl = it.baseUrl, apiKey = it.apiKey, model = it.model) }
             ?: throw IllegalStateException("请先配置 API")
@@ -929,10 +767,11 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         val all = db.messageDao().getAllMessagesForConversation(conversationId)
             .filter { it.isActiveBranch }
             .sortedBy { it.timestamp }
-        val target = all.find { it.id == messageId } ?: return
+        val target = all.find { it.id == messageId } ?: return false
         val conversation = getConversation(conversationId)
         val turnIndex = all.count { it.role == "user" && it.timestamp < target.timestamp } + 1
-        val matchedWorld = if (isInjectionTurn(turnIndex, conversation?.injectionInterval ?: 25)) {
+        val shouldInject = isInjectionTurn(turnIndex, conversation?.injectionInterval ?: 25)
+        val matchedWorld = if (shouldInject) {
             buildMatchedWorldInfo(conversation, newContent)
         } else emptyList()
 
@@ -958,33 +797,29 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         )
         val sb = StringBuilder()
         val persona = configRepo.getPersona().trim()
-        
-        // 注入提示
-        if (matchedWorld.isNotEmpty()) {
-            onInjectionNotice("已注入世界书信息（${matchedWorld.size} 条）")
-        }
-        if (persona.isNotEmpty()) {
-            onInjectionNotice("已注入用户设定")
-        }
-        // 角色卡注入提示
-        if (conversation?.useCharacterCard == true && conversation?.characterCardId != null) {
-            val card = conversation?.characterCardId?.let { db.characterCardDao().getById(it) }
-            card?.let { onInjectionNotice("已注入角色卡：${it.name}") }
-        }
+        // 官网原消息分支是否已删除（best-effort，编辑同步替换用）
+        var officialReplaced = false
         
         try {
             if (cfg.provider == "deepseek_web") {
-                // 官网：parent = 编辑消息之前那条消息的官网 id（按 content 匹配；首条则 null）
-                val prevMsg = all.filter { it.timestamp < target.timestamp }.lastOrNull()
-                val parentOverride = if (prevMsg != null) {
-                    deepSeekWebRepo?.findMessageIdByContent(conversationId, prevMsg.content, role = null)
+                val webRepo = deepSeekWebRepo
+                // 官网编辑走专用端点 /api/v0/chat/edit_message：用官方 message_id 定位被编辑的用户消息，
+                // 服务端原地替换该消息并重新生成回复（completion + parent/current_message_id 只会追加发出）。
+                val targetOfficialId = webRepo?.findMessageIdByContent(conversationId, target.content, role = "user")
+                officialReplaced = targetOfficialId != null
+                // 找不到被编辑消息的官网 id 时回退到 completion 追加（旧行为），避免直接失败
+                val parentOverride = if (targetOfficialId == null) {
+                    all.filter { it.timestamp < target.timestamp }.lastOrNull()?.let { prevMsg ->
+                        webRepo?.findMessageIdByContent(conversationId, prevMsg.content, role = null)
+                    }
                 } else null
                 streamWebReply(
                     conversationId = conversationId,
-                    prompt = buildWebPrompt(conversation, newContent, matchedWorld),
+                    prompt = buildWebPrompt(conversation, newContent, matchedWorld, null, shouldInject),
                     assistantId = assistantId,
                     assistantParentId = newUserMsgId,
                     parentOverride = parentOverride,
+                    editMessageId = targetOfficialId,
                     thinkingEnabled = thinkingEnabled,
                     searchEnabled = searchEnabled,
                     searchProvider = searchProvider,
@@ -1035,12 +870,14 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
                 getConversation(conversationId)!!.copy(updatedAt = System.currentTimeMillis())
             )
             onComplete()
+            return officialReplaced
         } catch (e: Exception) {
             if (sb.isEmpty()) {
                 db.messageDao().deleteMessages(conversationId, listOf(assistantId))
             }
             onError(e)
         }
+        return officialReplaced
     }
 
     /**
@@ -1191,7 +1028,17 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         val compressModel = db.conversationDao().getById(conversationId)?.compressionModel
             ?.takeIf { it.isNotBlank() } ?: cfg.model
 
-        val summary = summarize(cfg, compressModel, toCompress)
+        // 压缩模型可能属于其它 API 配置：必须用该模型所属配置的 baseUrl/apiKey 调总结接口，
+        // 否则用错了密钥/端点会报 401。找不到归属配置时回退到聊天配置。
+        val summaryCfg = if (compressModel == cfg.model) {
+            cfg
+        } else {
+            db.savedModelDao().getAllOnce().firstOrNull { it.model == compressModel }
+                ?.apiProfileId?.let { pid -> db.apiProfileDao().getById(pid) }
+                ?: cfg
+        }
+
+        val summary = summarize(summaryCfg, compressModel, toCompress)
         val compressIds = toCompress.map { it.id }
 
         // 删除被压缩的消息（不是仅标记非活跃）
@@ -1225,25 +1072,63 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
     }
 
     private suspend fun summarize(profile: ApiProfileEntity, model: String, messages: List<MessageEntity>): String {
-        val prompt = "请用中文简洁地总结以下对话的要点（角色、主题、已确定的事实、当前进展），保留关键细节，200字以内：\n\n" +
-                messages.joinToString("\n") { "${if (it.role == "user") "用户" else "助手"}: ${it.content}" }
+        val locale = if (messages.any { it.content.contains(Regex("[\\u4e00-\\u9fa5]")) }) "中文" else "English"
+        val conversationText = messages.joinToString("\n\n") {
+            "${if (it.role == "user") "用户" else "助手"}: ${it.content}"
+        }
+        val prompt = "You are a conversation compression assistant. Compress the following conversation into a concise summary.\n\n" +
+            "Requirements:\n" +
+            "1. Preserve key facts, decisions, and important context that would be needed to continue the conversation\n" +
+            "2. Keep the summary in the same language as the original conversation\n" +
+            "3. Target approximately 4000 tokens\n" +
+            "4. Output the summary directly without any explanations or meta-commentary\n" +
+            "5. Format the summary as context information that can be used to continue the conversation\n" +
+            "6. Use $locale language\n" +
+            "7. Start the output with a clear indicator that this is a summary (e.g., \"[Summary of previous conversation]\" or equivalent in the target language)\n\n" +
+            "{additional_context}\n\n" +
+            "<conversation>\n$conversationText\n</conversation>"
         val request = ChatRequest(
             model = model,
             messages = listOf(
-                Message("system", "你是一个对话总结助手。"),
+                Message("system", "你是对话压缩助手，输出严格遵循用户要求的格式。"),
                 Message("user", prompt)
             ),
-            stream = false
+            stream = false,
+            max_tokens = 4000
         )
         if (profile.protocol == "anthropic") {
             return anthropicClient.completeText(profile.baseUrl, profile.apiKey, request)
         }
         val url = "${profile.baseUrl.trimEnd('/')}/chat/completions"
-        val response = apiService.chatCompletion(url, request)
-        if (!response.isSuccessful) {
-            throw IllegalStateException("总结失败: HTTP ${response.code()}")
+        // 用带 Authorization 的原始 okhttp 请求（Retrofit 的 ApiService 不带任何请求头，
+        // 直接调用会因缺少 Bearer 凭证而 401）。同步 execute() 是阻塞调用，
+        // 必须在 IO 线程执行，否则会卡住主线程导致"点了没反应"。
+        return withContext(Dispatchers.IO) {
+            val json = com.google.gson.Gson().toJson(request)
+            val okhttp = com.yourapp.chat.ChatApplication.instance.okHttpClient
+            val req = okhttp3.Request.Builder()
+                .url(url)
+                .addHeader("Authorization", "Bearer ${profile.apiKey}")
+                .addHeader("Content-Type", "application/json")
+                .post(json.toRequestBody("application/json".toMediaTypeOrNull()))
+                .build()
+            okhttp.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    throw IllegalStateException("总结失败 HTTP ${resp.code}: ${resp.body?.string().orEmpty().take(200)}")
+                }
+                val text = resp.body?.string() ?: ""
+                val parsed = com.google.gson.JsonParser.parseString(text).asJsonObject
+                val choices = parsed.getAsJsonArray("choices")
+                if (choices.isEmpty()) throw IllegalStateException("总结接口无返回")
+                choices[0].asJsonObject
+                    .getAsJsonObject("message")
+                    ?.get("content")
+                    ?.asString
+                    ?.trim()
+                    ?.takeIf { it.isNotBlank() }
+                    ?: "(无总结)"
+            }
         }
-        return response.body()?.choices?.firstOrNull()?.message?.content ?: "(无总结)"
     }
 
     /**
@@ -1340,19 +1225,37 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
     /**
      * 用指定的识图模型（保存的识图能力模型）描述一张图片，返回文字描述。
      * 仅支持 OpenAI 兼容协议；失败抛异常。
+     * @param label 该图片的名称/序号，写进提示词让模型明确"正在看哪张"，避免多图/连续识图时
+     * 视觉模型或缓存通道按上一张图/上一次提示词作答。
      */
     suspend fun describeImage(
         profile: ApiProfileEntity,
         visionModelName: String,
-        imageDataUrl: String
+        imageDataUrl: String,
+        label: String = "你上传的图片"
     ): String = withContext(kotlinx.coroutines.Dispatchers.IO) {
-        val baseUrl = profile.baseUrl.trimEnd('/')
+        // 识图模型可能属于其它 API 配置：必须用该模型所属配置的 baseUrl/apiKey 调识图接口，
+        // 否则用错密钥/端点会 401/404（与压缩模型同款处理）。找不到归属配置时回退到聊天配置。
+        val visionCfg = db.savedModelDao().getAllOnce().firstOrNull { it.model == visionModelName }
+            ?.apiProfileId?.let { pid -> db.apiProfileDao().getById(pid) }
+            ?: profile
+        val baseUrl = visionCfg.baseUrl.trimEnd('/')
+        val ocrPrompt = "这是用户最新发送的一张真实图片【$label】。请只针对这张图片（忽略任何之前的图片或之前的描述），\n\n" +
+            "Extract all visible text from the image and also describe any non-text elements (icons, shapes, arrows, objects, symbols, or emojis).\n\n" +
+            "For each element, specify:\n" +
+            "- The exact text (for text) or a short description (for non-text).\n" +
+            "- For document-type content, please use markdown and latex format.\n" +
+            "- If there are objects like buildings or characters, try to identify who they are.\n" +
+            "- Its approximate position in the image (e.g., 'top left', 'center right', 'bottom middle').\n" +
+            "- Its spatial relationship to nearby elements (e.g., 'above', 'below', 'next to', 'on the left of').\n\n" +
+            "Keep the original reading order and layout structure as much as possible.\n" +
+            "Do not interpret or translate—only transcribe and describe what is visually present."
         val body = com.google.gson.JsonObject().apply {
             addProperty("model", visionModelName)
             val contentArr = com.google.gson.JsonArray()
             val textPart = com.google.gson.JsonObject().apply {
                 addProperty("type", "text")
-                addProperty("text", "请详细描述这张图片的内容，包括主体、场景、文字和视觉细节。")
+                addProperty("text", ocrPrompt)
             }
             contentArr.add(textPart)
             val imgPart = com.google.gson.JsonObject().apply {
@@ -1375,7 +1278,7 @@ suspend fun toggleFavorite(messageId: Long, favorite: Boolean) {
         val okhttp = com.yourapp.chat.ChatApplication.instance.okHttpClient
         val req = okhttp3.Request.Builder()
             .url("$baseUrl/chat/completions")
-            .addHeader("Authorization", "Bearer ${profile.apiKey}")
+            .addHeader("Authorization", "Bearer ${visionCfg.apiKey}")
             .addHeader("Content-Type", "application/json")
             .post(json.toRequestBody("application/json".toMediaTypeOrNull()))
             .build()

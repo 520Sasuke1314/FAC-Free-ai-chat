@@ -1,19 +1,29 @@
 package com.yourapp.chat.ui.screen.conversationlist
 
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.size
@@ -29,6 +39,8 @@ import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -45,6 +57,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -53,6 +66,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -75,9 +90,7 @@ fun ConversationListScreen(
     var showNewDialog by remember { mutableStateOf(false) }
     var searching by remember { mutableStateOf(false) }
     var searchText by remember { mutableStateOf("") }
-    var renaming by remember { mutableStateOf<ConversationWithLast?>(null) }
-    // 会话列表滚动状态：让列表在置顶飞行动画之外，也具备设置页式的平滑上下滚动手感
-    val listState = rememberLazyListState()
+var renaming by remember { mutableStateOf<ConversationWithLast?>(null) }
 
     // 当前 API 摘要：通道 + 模型 + 脱敏 key，点击进 API 配置页
     val currentProfile = state.apiProfiles.firstOrNull { it.id == state.selectedProfileId }
@@ -156,19 +169,23 @@ fun ConversationListScreen(
                     style = MaterialTheme.typography.bodyLarge
                 )
             }
-        } else {
-            // LazyColumn + animateItem：置顶/取消置顶行飞行动画（往上飞到顶部/往下飞回原位）
-            // 淡入淡出关闭（tween(0)），只保留位置飞行
+} else {
+            // LazyColumn 虚拟化：只渲染可见行，配合极简行（无手势无动画），
+            // 即使几百条对话也流畅。避免 Column 全量渲染导致每帧测量/布局所有行。
             LazyColumn(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding)
                     .padding(horizontal = 16.dp),
-                state = listState,
+                state = rememberLazyListState(),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(state.conversations, key = { it.conversation.id }, contentType = { "conversation" }) { item ->
+                items(
+                    state.conversations,
+                    key = { it.conversation.id },
+                    contentType = { "conversation" }
+                ) { item ->
                     ConversationRow(
                         item = item,
                         modifier = Modifier.animateItem(
@@ -179,7 +196,7 @@ fun ConversationListScreen(
                         onOpen = { onOpenChat(item.conversation.id) },
                         onRename = { renaming = item },
                         onDelete = { vm.deleteConversation(item.conversation) },
-                        onSwipeRight = { vm.togglePin(item.conversation) }
+                        onTogglePin = { vm.togglePin(item.conversation) }
                     )
                 }
             }
@@ -216,53 +233,44 @@ private fun ConversationRow(
     onOpen: () -> Unit,
     onRename: () -> Unit,
     onDelete: () -> Unit,
-    onSwipeRight: () -> Unit
+    onTogglePin: () -> Unit
 ) {
+    val isPinned = item.conversation.pinned
+    var menuOpen by remember { mutableStateOf(false) }
+
     val density = LocalDensity.current
     val thresholdPx = with(density) { 80.dp.toPx() }
 
-    // —— 临时诊断：统计该行被重组的次数，滑动时若持续增长即可判定重组问题。定位后删除 ——
-    androidx.compose.runtime.SideEffect {
-        RecompDiag.count++
-        if (RecompDiag.count % 50 == 0) android.util.Log.w("RecompDiag", "总重组 ${RecompDiag.count} 次 (会话行)")
-    }
-
-    // 拖动偏移动画（与收藏页完全一致）
+    // 右滑置顶：拖动偏移动画（沿用收藏页一致实现）
     var dragOffset by remember { mutableStateOf(0f) }
     val animatedOffset = animateFloatAsState(
         targetValue = dragOffset,
         animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow)
     )
 
-    // 置顶图标动画状态
-    val isPinned = item.conversation.pinned
+    // 置顶图标旋转动画
     var pinRotation by remember { mutableStateOf(0f) }
     val animatedPinRotation = animateFloatAsState(
         targetValue = pinRotation,
         animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium)
     )
-
-    // 触发置顶动画
     LaunchedEffect(isPinned) {
         pinRotation = if (isPinned) 360f else 0f
     }
 
     Row(
         modifier = modifier
-            // 置顶条目抬升 z 序：置顶后会变成列表第一个子项（先绘制），
-            // 飞行动画会被其余条目盖住；抬升后置顶动画始终浮在最上层
+            // 置顶条目抬升 z 序：避免飞行动画被其余条目盖住
             .zIndex(if (isPinned) 1f else 0f)
             .fillMaxWidth()
             .graphicsLayer { translationX = animatedOffset.value }
-            // 会话卡片：圆角 + 实色底（置顶态用主题色区分）。
-            // 注意用实色而非 copy(alpha)：列表行在半透明背景下每帧要做两层混合，
-            // 低端设备/软件渲染下多行同时滚动会明显掉帧；实色一行只有一次绘制。
+            // 圆角实色卡片
             .clip(RoundedCornerShape(16.dp))
             .background(
                 if (isPinned) MaterialTheme.colorScheme.primaryContainer
                 else MaterialTheme.colorScheme.surfaceContainerHigh
             )
-            // 手势与收藏页完全一致：pointerInput 以 isPinned 为 key，右滑到阈值即切换置顶
+            // 右滑置顶：达到阈值切换置顶（与收藏页一致）
             .pointerInput(isPinned) {
                 var total = 0f
                 detectHorizontalDragGestures(
@@ -272,15 +280,13 @@ private fun ConversationRow(
                     },
                     onHorizontalDrag = { _, dragAmount ->
                         total += dragAmount
-                        // 仅响应向右滑动，超过限位器前可自由拖动
                         if (total > 0) {
                             dragOffset = kotlin.math.min(total, thresholdPx * 1.5f)
                         }
                     },
                     onDragEnd = {
-                        // 限位器判定：达到阈值则置顶/取消置顶，否则复位
                         if (total >= thresholdPx) {
-                            onSwipeRight()
+                            onTogglePin()
                         }
                         total = 0f
                         dragOffset = 0f
@@ -291,11 +297,14 @@ private fun ConversationRow(
                     }
                 )
             }
-            .combinedClickable(onClick = onOpen, onLongClick = onRename)
+            .combinedClickable(
+                onClick = onOpen,
+                onLongClick = { menuOpen = true }
+            )
             .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // 置顶图标带旋转动画
+        // 置顶图标带旋转动画；未置顶时右滑超过 30% 显示置顶预览图标
         if (isPinned) {
             Icon(
                 Icons.Filled.PushPin,
@@ -306,8 +315,6 @@ private fun ConversationRow(
                     .size(24.dp)
             )
         } else {
-            // 拖动预览/默认图标用普通 if/else 切换（列表行内不用 AnimatedVisibility，
-            // 它会在滚动组合新行时为每行创建过渡状态机，长列表滚动卡顿）
             val showPinPreview = dragOffset > thresholdPx * 0.3f
             if (showPinPreview) {
                 Icon(
@@ -340,8 +347,7 @@ private fun ConversationRow(
                 }
             }
             item.lastMessage?.let {
-                // 预览只取前 60 字（与收藏页一致）：完整正文动辄几十 KB，
-                // 滚动换入新行时巨量测字会拖垮帧率
+                // 预览只取前 60 字（与收藏页一致）：完整正文动辄几十 KB，测字开销大
                 Text(
                     text = it.take(60),
                     style = MaterialTheme.typography.bodySmall,
@@ -353,6 +359,32 @@ private fun ConversationRow(
         }
         IconButton(onClick = onDelete) {
             Icon(Icons.Filled.Delete, contentDescription = "删除")
+        }
+        // 长按菜单：放在 Row 内，锚点绑定到行本身（与收藏页一致，Row 为根节点）
+        DropdownMenu(
+            expanded = menuOpen,
+            onDismissRequest = { menuOpen = false }
+        ) {
+            DropdownMenuItem(
+                text = { Text(if (isPinned) "取消置顶" else "置顶") },
+                onClick = {
+                    menuOpen = false
+                    onTogglePin()
+                },
+                leadingIcon = {
+                    Icon(Icons.Filled.PushPin, contentDescription = null)
+                }
+            )
+            DropdownMenuItem(
+                text = { Text("重命名") },
+                onClick = {
+                    menuOpen = false
+                    onRename()
+                },
+                leadingIcon = {
+                    Icon(Icons.Filled.Search, contentDescription = null) // 占位图标
+                }
+            )
         }
     }
 }
@@ -426,8 +458,6 @@ private fun formatTime(ts: Long): String {
         diff < 86_400_000 -> "${diff / 3_600_000}小时前"
         diff < 2 * 86_400_000 -> "昨天"
         diff < 7 * 86_400_000 -> "${diff / 86_400_000}天前"
-        else -> DateFmt.format(Date(ts))
+else -> DateFmt.format(Date(ts))
     }
 }
-
-object RecompDiag { var count = 0 }

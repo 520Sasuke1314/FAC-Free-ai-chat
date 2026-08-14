@@ -16,8 +16,6 @@ import com.yourapp.chat.data.repository.CharacterCardRepository
 import com.yourapp.chat.data.repository.ConfigRepository
 import com.yourapp.chat.data.repository.WorldEntryRepository
 import com.yourapp.chat.data.local.AppDatabase
-import com.yourapp.chat.data.remote.PhoneWebSearch
-import com.yourapp.chat.data.remote.ShizukuHelper
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -47,9 +45,6 @@ data class ChatUiState(
     /** 思考力度：-1=自动，0=不思考，1-5=力度（5 最大） */
     val thinkingLevel: Int = -1,
     val searchEnabled: Boolean = false,
-    val searchProvider: String = "bing",
-    val searchEngineUrl: String = "https://www.bing.com/search?q={query}",
-    val showSearchPicker: Boolean = false,
     val showCardPicker: Boolean = false,
     val showWorldPicker: Boolean = false,
     val showApiPicker: Boolean = false,
@@ -67,8 +62,7 @@ data class ChatUiState(
     val savedVisionModels: List<com.yourapp.chat.data.local.entity.SavedModelEntity> = emptyList(),
     /** 识图专用模型名（空 = 未配置） */
     val visionModel: String = "",
-    val compressKeepCount: Int = 32,
-    /** 上下文压缩专用模型名（空 = 复用聊天模型） */
+    val compressKeepCount: Int = 32,    /** 上下文压缩专用模型名（空 = 复用聊天模型） */
     val compressionModel: String = "",
     val injectionInterval: Int = 25,
     val streamingEnabled: Boolean = true,
@@ -86,10 +80,8 @@ data class ChatUiState(
     val syncVersion: Int = 0,
     /** 处理状态（如识图中、OCR中），用于在输入区显示进度 */
     val processingStatus: String? = null,
-    /** 自建 API 联网搜索：是否正在浏览网页 */
-    val webBrowsing: Boolean = false,
-    /** 待触发 Shizuku 授权（联网搜索需要该权限，UI 监听到 true 时弹出授权窗口） */
-    val shizukuGrantRequested: Boolean = false
+    /** 上下文压缩进行中（UI 用于展示"正在总结…"动画） */
+    val isCompressing: Boolean = false
 )
 
 /** 待发送附件：图片存 dataURL，文本直接存内容 */
@@ -137,7 +129,12 @@ class ChatViewModel(
         }
         viewModelScope.launch {
             chatRepository.getActiveMessages(conversationId).collect { messages ->
-                _uiState.update { it.copy(messages = messages) }
+                _uiState.update {
+                    // 压缩保留条数默认设为当前对话总消息数的四分之一（用户未手动改时）
+                    it.compressKeepCount.takeIf { c -> c != DEFAULT_COMPRESS_KEEP_COUNT }
+                        ?.let { c -> it.copy(messages = messages, compressKeepCount = c) }
+                        ?: it.copy(messages = messages, compressKeepCount = (messages.size / 4).coerceAtLeast(1))
+                }
             }
         }
         viewModelScope.launch {
@@ -213,43 +210,14 @@ class ChatViewModel(
             return
         }
         _uiState.update { it.copy(inputText = "", isSending = true, error = null, streamingContent = null, streamingThinking = null, injectionNotice = null) }
-        // 思考力度：非官网用滑块（0=不思考；自动/1-5=思考，自动交给模型决定力度）；官网免费用开关
         val thinking = resolveThinking()
-        // 联网搜索开关（已移除 UI，功能默认关闭）+ 自动识别"需要联网搜"的表述。
-        // 因 UI 开关已删除且功能默认关闭，这里固定不联网，仅保留逻辑代码。
-        val search = false
-        val provider = _uiState.value.searchProvider
         val isWebChannel = profile.provider == "deepseek_web"
-        // 自建 API 联网搜索需要 Shizuku 授权：未授权则弹出授权窗口并中止本次发送
-        if (search && !isWebChannel && !ShizukuHelper.isGranted()) {
-            _uiState.update {
-                it.copy(isSending = false, shizukuGrantRequested = true, error = null, info = "联网搜索需要 Shizuku 授权，请在弹出的窗口中点击「允许」后再发送")
-            }
-            return
-        }
+        // 联网搜索：仅官网免费通道原生支持（自建 API 联网搜索功能已移除）
+        val search = true
+        val provider = "bing"
         sendJob?.cancel()
         sendJob = viewModelScope.launch {
             try {
-                // 自建 API 联网搜索：用手机网络浏览网页，注入结果给 AI
-                var webSearchPrompt: String? = null
-                var webSourcesJson: String? = null
-                if (search && !isWebChannel) {
-                    _uiState.update { it.copy(webBrowsing = true) }
-                    try {
-                        val results = PhoneWebSearch.search(text, limit = 5, engine = provider, customEngineUrl = _uiState.value.searchEngineUrl)
-                        if (results.isEmpty()) {
-                            _uiState.update { it.copy(info = "没有搜索到相关网页，将直接回答") }
-                        } else {
-                            webSearchPrompt = PhoneWebSearch.buildPrompt(text, results)
-                            webSourcesJson = PhoneWebSearch.buildSourcesJson(results)
-                        }
-                    } catch (e: Exception) {
-                        _uiState.update { it.copy(info = "联网搜索失败：${e.message}") }
-                    } finally {
-                        _uiState.update { it.copy(webBrowsing = false) }
-                    }
-                }
-                val isWebChannel = profile.provider == "deepseek_web"
                 // 官网免费通道不支持图片附件：剔除图片并提示，正文与文本附件照常发送
                 val sendableAttachments = if (isWebChannel) attachments.filter { !it.isImage } else attachments
                 val textAttachments = sendableAttachments.filter { !it.isImage }
@@ -283,13 +251,34 @@ class ChatViewModel(
                     if (visionModelName.isNotBlank() && profile.provider != "deepseek_web") {
                         try {
                             _uiState.update { it.copy(processingStatus = "正在识别图片…") }
-                            val descriptions = imageAttachments.map { a ->
-                                chatRepository.describeImage(profile, visionModelName, a.content)
+                            val descriptions = imageAttachments.mapIndexed { idx, a ->
+                                val label = "第 ${idx + 1} 张图片（${a.name}）"
+                                try {
+                                    chatRepository.describeImage(profile, visionModelName, a.content, label)
+                                } catch (e1: Exception) {
+                                    // 网络抖动/限流重试一次
+                                    chatRepository.describeImage(profile, visionModelName, a.content, label)
+                                }
                             }
-                            visionDescription = descriptions.joinToString("\n\n")
+                            // 每张图的描述带明确标签，避免模型把多图/历史图混在一起
+                            visionDescription = descriptions.mapIndexed { idx, d ->
+                                "【第 ${idx + 1} 张图片（${imageAttachments[idx].name}）】\n$d"
+                            }.joinToString("\n\n")
+                            // 多图时若所有描述一模一样（疑为视觉模型/通道未真正按图作答），
+                            // 同时回退原生多模态发送，让支持图片的聊天模型还能看到真实图片
+                            val distinct = descriptions.map { it.trim() }.distinct()
+                            if (imageAttachments.size > 1 && distinct.size == 1 && distinct.first().isNotBlank()) {
+                                imageDataUrls = imageAttachments.map { it.content }
+                            }
                         } catch (e: Exception) {
-                            // 识图失败：回退为原生多模态发送，避免整条消息失败（rikkahub 思路）
+                            // 识图失败：不再静默回退（否则聊天模型不支持图片时 AI 只会按旧上下文回答）。
+                            // 回退原生多模态发送的同时，注入失败说明让 AI 至少知道有图片（本地提示用户）。
                             imageDataUrls = imageAttachments.map { it.content }
+                            val msg = e.message ?: "未知错误"
+                            _uiState.update {
+                                it.copy(info = "识图模型识别失败：$msg（已回退原生图片发送，若聊天模型不支持图片将无法识别）")
+                            }
+                            visionDescription = "（用户本次附带了图片，但识图模型识别失败：$msg，请告知用户图片未能识别）"
                         } finally {
                             _uiState.update { it.copy(processingStatus = null) }
                         }
@@ -310,9 +299,6 @@ class ChatViewModel(
                     thinkingEnabled = thinking,
                     searchEnabled = search,
                     searchProvider = provider,
-                    customEngineUrl = _uiState.value.searchEngineUrl,
-                    webSearchPrompt = webSearchPrompt,
-                    webSourcesJson = webSourcesJson,
                     imageDataUrls = imageDataUrls,
                     visionContext = visionDescription.takeIf { it.isNotBlank() },
                     attachmentText = attachmentText,
@@ -413,7 +399,7 @@ class ChatViewModel(
                     profile = profile,
                     thinkingEnabled = resolveThinking(),
                     searchEnabled = _uiState.value.searchEnabled,
-                    searchProvider = _uiState.value.searchProvider
+                    searchProvider = null
                 )
                 _uiState.update {
                     it.copy(
@@ -443,7 +429,7 @@ class ChatViewModel(
         sendJob?.cancel()
         sendJob = viewModelScope.launch {
             try {
-                chatRepository.editUserMessage(
+                val replaced = chatRepository.editUserMessage(
                     conversationId = conversationId,
                     messageId = messageId,
                     newContent = newContent,
@@ -456,12 +442,17 @@ class ChatViewModel(
                     profile = profile,
                     thinkingEnabled = resolveThinking(),
                     searchEnabled = _uiState.value.searchEnabled,
-                    searchProvider = _uiState.value.searchProvider
+                    searchProvider = null
                 )
                 _uiState.update {
                     it.copy(
                         isSending = false,
-                        info = "已编辑并重新生成",
+                        info = if (profile.provider == "deepseek_web") {
+                            if (replaced) "已编辑并替换官网原消息"
+                            else "已编辑并重新生成（官网原消息未能删除，可能显示为追加）"
+                        } else {
+                            "已编辑并重新生成"
+                        },
                         injectionNotice = null,
                         conversationUsedApi = it.conversationUsedApi || profile.provider != "deepseek_web"
                     )
@@ -490,27 +481,27 @@ class ChatViewModel(
     /** 压缩上下文 */
     fun compressContext() {
         viewModelScope.launch {
-            _uiState.update { it.copy(isSending = true, error = null) }
+            _uiState.update { it.copy(isSending = true, isCompressing = true, error = null) }
             try {
                 val profile = _uiState.value.apiProfiles.firstOrNull { it.id == _uiState.value.selectedProfileId }
                 chatRepository.compressContext(conversationId, profile, _uiState.value.compressKeepCount)
-                _uiState.update { it.copy(isSending = false, info = "上下文已压缩") }
+                _uiState.update { it.copy(isSending = false, isCompressing = false, info = "上下文已压缩") }
             } catch (e: Exception) {
-                _uiState.update { it.copy(isSending = false, error = e.message) }
+                _uiState.update { it.copy(isSending = false, isCompressing = false, error = e.message) }
             }
         }
     }
 
     fun toggleCardPicker() {
-        _uiState.update { it.copy(showCardPicker = !it.showCardPicker, showWorldPicker = false, showApiPicker = false, showSearchPicker = false, showSettings = false) }
+        _uiState.update { it.copy(showCardPicker = !it.showCardPicker, showWorldPicker = false, showApiPicker = false, showSettings = false) }
     }
 
     fun toggleWorldPicker() {
-        _uiState.update { it.copy(showWorldPicker = !it.showWorldPicker, showCardPicker = false, showApiPicker = false, showSearchPicker = false, showSettings = false) }
+        _uiState.update { it.copy(showWorldPicker = !it.showWorldPicker, showCardPicker = false, showApiPicker = false, showSettings = false) }
     }
 
     fun toggleApiPicker() {
-        _uiState.update { it.copy(showApiPicker = !it.showApiPicker, showCardPicker = false, showWorldPicker = false, showSearchPicker = false, showSettings = false) }
+        _uiState.update { it.copy(showApiPicker = !it.showApiPicker, showCardPicker = false, showWorldPicker = false, showSettings = false) }
     }
 
     fun selectApi(profileId: Long) {
@@ -645,37 +636,6 @@ class ChatViewModel(
 
     fun setSearch(enabled: Boolean) {
         _uiState.update { it.copy(searchEnabled = enabled) }
-        // 打开自建 API 联网搜索时立即申请 Shizuku 权限（未授予则弹窗）
-        if (enabled) {
-            val isWeb = _uiState.value.apiProfiles.firstOrNull { it.id == _uiState.value.selectedProfileId }?.provider == "deepseek_web"
-            if (!isWeb && !ShizukuHelper.isGranted()) {
-                _uiState.update { it.copy(shizukuGrantRequested = true, info = "联网搜索需要 Shizuku 授权，请在弹出的窗口中点击「允许」") }
-            }
-        }
-    }
-
-    /** 仅供 UI 触发 Shizuku 授权窗口 */
-    fun requestShizuku() {
-        _uiState.update { it.copy(shizukuGrantRequested = true) }
-    }
-
-    /** Shizuku 授权结果回调（UI 调用） */
-    fun onShizukuResult(granted: Boolean) {
-        _uiState.update {
-            it.copy(
-                shizukuGrantRequested = false,
-                info = if (granted) "已获得 Shizuku 授权，联网搜索可用" else "未获得 Shizuku 授权，联网搜索不可用"
-            )
-        }
-    }
-
-    /** 是否已具备联网搜索条件（官网通道总是可用；自建 API 需 Shizuku 已授权） */
-    fun canSearchNow(): Boolean {
-        if (_uiState.value.searchEnabled) {
-            val isWeb = _uiState.value.apiProfiles.firstOrNull { it.id == _uiState.value.selectedProfileId }?.provider == "deepseek_web"
-            return isWeb || ShizukuHelper.isGranted()
-        }
-        return false
     }
 
     fun setStreaming(enabled: Boolean) {
@@ -683,13 +643,8 @@ class ChatViewModel(
         _uiState.update { it.copy(streamingEnabled = enabled) }
     }
 
-    fun toggleSearchPicker() {
-        // 注意：不能重置 showSettings=false，否则从设置页打开搜索引擎选择器时会退回到聊天页。
-        _uiState.update { it.copy(showSearchPicker = !it.showSearchPicker, showCardPicker = false, showWorldPicker = false, showApiPicker = false) }
-    }
-
     fun toggleSettings() {
-        _uiState.update { it.copy(showSettings = !it.showSettings, showCardPicker = false, showWorldPicker = false, showApiPicker = false, showSearchPicker = false) }
+        _uiState.update { it.copy(showSettings = !it.showSettings, showCardPicker = false, showWorldPicker = false, showApiPicker = false) }
     }
 
     fun toggleBranchPicker() {
@@ -721,15 +676,10 @@ class ChatViewModel(
                 showModelPicker = false,
                 showCompressionModelPicker = false,
                 showVisionModelPicker = false,
-                showSearchPicker = false,
                 showBranchPicker = false,
                 showRewritePicker = false
             )
         }
-    }
-
-    fun selectSearchProvider(provider: String, engineUrl: String) {
-        _uiState.update { it.copy(searchProvider = provider, searchEngineUrl = engineUrl, showSearchPicker = false) }
     }
 
     /** 从官网拉取当前会话消息，写入本地对话（反向同步），并切换到官网会话 */
@@ -838,6 +788,10 @@ class ChatViewModel(
         }
     }
 
+    fun setSearchEnabled(enabled: Boolean) {
+        _uiState.update { it.copy(searchEnabled = enabled) }
+    }
+
     /** 更新对话参数设置 */
     fun updateConversationSettings(
         showThinking: Boolean,
@@ -900,38 +854,10 @@ class ChatViewModel(
         }
     }
 
-    /**
-     * 判断用户本轮表述是否"隐含联网搜索需求"。命中即自动触发本次联网搜索，
-     * 无需用户手动打开搜索开关。关键词匹配到「搜索/查找」类动词，或「XX 是什么/什么意思/
-     * 怎么了/新闻/为什么/多少钱/天气预报/股票 等需要实时或外部信息的表述」。
-     */
-    private fun isSearchIntent(input: String): Boolean {
-        val t = input.trim()
-        if (t.isBlank()) return false
-        // 搜索类动词（含引申）
-        val searchVerbs = listOf(
-            "搜索", "搜一", "搜一下", "搜搜", "查一下", "查查", "查一", "查找", "查询", "搜",
-            "百度", "谷歌", "google", "bing", "上网搜", "帮你搜", "帮我搜",
-            "查一下", "查下", "搜索一下", "搜出来"
-        )
-        // 问"某某是什么/什么意思"等需要百科/实时信息的问题
-        val questionPatterns = listOf(
-            "是什么", "什么是", "啥是", "怎么回", "怎么了", "为什么", "为何", "在哪",
-            "在哪里", "哪个", "多少钱", "价格", "最新", "今天", "现在", "近日", "新闻",
-            "时事", "天气预报", "天气", "股票", "汇率", "油价", "足球", "比赛", "比分"
-        )
-        val lower = t.lowercase()
-        val hasSearchVerb = searchVerbs.any { t.contains(it) }
-        val hasQuestion = questionPatterns.any { t.contains(it) }
-        // 单纯闲聊式提问（如「你今天好吗」）不应触发搜索：排除太短/过于口语的普通问候
-        if (!hasSearchVerb && !hasQuestion) return false
-        // 排除明显的非搜索闲聊，避免误触发
-        val casual = listOf("你好", "再见", "谢谢", "请问你好", "你是谁", "你能做什么")
-        if (casual.any { t.contains(it) }) return false
-        return lower.length > 1
-    }
-
     companion object {
+        /** 压缩保留条数默认值（实际运行时会被当前对话总消息数覆盖） */
+        private const val DEFAULT_COMPRESS_KEEP_COUNT = 32
+
         fun factory(conversationId: Long): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T {

@@ -142,9 +142,12 @@ class WorldListViewModel(
                 val entries = CharacterCardParser.parseWorldFile(tmp)
                 tmp.delete()
 
-                val displayName = uri.lastPathSegment?.substringAfterLast('/')?.substringBeforeLast('.')
-                    ?.take(30) ?: "世界书"
-                val bookId = repository.createBook(displayName.ifBlank { "世界书" })
+                val fileName = uri.lastPathSegment?.substringAfterLast('/')?.substringBeforeLast('.')
+                    ?.take(30)
+                val displayName = CharacterCardParser.extractWorldName(bytes)
+                    ?: fileName?.ifBlank { "世界书" }
+                    ?: "世界书"
+                val bookId = repository.createBook(displayName)
                 entries.forEach { w ->
                     repository.insert(
                         WorldEntryEntity(

@@ -42,6 +42,7 @@ class DeepSeekWebClient(private val okHttpClient: OkHttpClient) {
         const val COMPLETION = "$BASE/chat/completion"
         const val CONTINUE = "$BASE/chat/continue"
         const val REGENERATE = "$BASE/chat/regenerate"
+        const val EDIT_MESSAGE = "$BASE/chat/edit_message"
         const val UPLOAD_FILE = "$BASE/upload_file"
 
         val DEFAULT_HEADERS = mapOf(
@@ -485,6 +486,68 @@ class DeepSeekWebClient(private val okHttpClient: OkHttpClient) {
             .put("thinking_enabled", thinkingEnabled)
             .put("search_enabled", searchEnabled)
             .put("user_options", JSONObject.NULL)
+        if (includeThinking) {
+            b.put("thinking", JSONObject().put("type", if (thinkingEnabled) "enabled" else "disabled"))
+        }
+        return b
+    }
+
+    /**
+     * 官网编辑消息（POST /api/v0/chat/edit_message）。
+     * 用 message_id 定位被编辑的那条用户消息，服务端**原地替换**该消息并重新生成回复，
+     * 不会像 completion 通道那样把新内容当作追加发送到会话末尾。
+     * 请求体只有 chat_session_id / message_id / prompt / 开关，不需要 parent_message_id。
+     * @param messageId 被编辑用户消息的官方 message_id
+     */
+    suspend fun editMessageStream(
+        token: String,
+        sessionId: String,
+        messageId: Long,
+        prompt: String,
+        thinkingEnabled: Boolean = true,
+        searchEnabled: Boolean = false,
+        onMessageId: (Long?) -> Unit = {},
+        onRequestMessageId: (Long?) -> Unit = {},
+        onThinking: (String) -> Unit = {},
+        onFinished: (contentFilter: Boolean) -> Unit = {}
+    ): Flow<String> = flow {
+        val solvedPow = solvePow(token)
+
+        // 同 completion 通道：优先带新版 thinking 对象，400 时回退仅旧字段
+        var body = editMessageBody(sessionId, messageId, prompt, thinkingEnabled, searchEnabled, includeThinking = true)
+        var req = buildRequest(EDIT_MESSAGE, body.toString(), token, solvedPow)
+        var response = withContext(Dispatchers.IO) {
+            streamingClient.newCall(req).execute()
+        }
+        if (!response.isSuccessful && response.code == 400) {
+            response.close()
+            body = editMessageBody(sessionId, messageId, prompt, thinkingEnabled, searchEnabled, includeThinking = false)
+            req = buildRequest(EDIT_MESSAGE, body.toString(), token, solvedPow)
+            response = withContext(Dispatchers.IO) {
+                streamingClient.newCall(req).execute()
+            }
+        }
+        if (!response.isSuccessful) {
+            throw IOException("API error: ${response.code} ${response.message}")
+        }
+        emitAll(parseWebStream(response, thinkingEnabled, onMessageId, onRequestMessageId, onThinking, onFinished))
+    }
+
+    /** 官网编辑消息请求体：新版 thinking 对象可选（400 时回退） */
+    private fun editMessageBody(
+        sessionId: String,
+        messageId: Long,
+        prompt: String,
+        thinkingEnabled: Boolean,
+        searchEnabled: Boolean,
+        includeThinking: Boolean
+    ): JSONObject {
+        val b = JSONObject()
+            .put("chat_session_id", sessionId)
+            .put("message_id", messageId)
+            .put("prompt", prompt)
+            .put("search_enabled", searchEnabled)
+            .put("thinking_enabled", thinkingEnabled)
         if (includeThinking) {
             b.put("thinking", JSONObject().put("type", if (thinkingEnabled) "enabled" else "disabled"))
         }

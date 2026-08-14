@@ -148,10 +148,49 @@ class DeepSeekWebRepository(
     }
 
     /**
-     * 该对话最近一条 AI 回复的官方 message_id（chatStream 每次成功后由 onMessageId 记录）。
-     * 重新生成最后一条回复时直接把它作 parent：官网会用新回复替换这条回复（ds2api 同款机制），
-     * 而不是把用户消息再发一遍。
+     * 官网编辑消息：走专用端点 /api/v0/chat/edit_message，用官方 message_id 定位被编辑的用户消息，
+     * 服务端原地替换该消息并重新生成回复（这才是官网"修改输入"的正确机制，
+     * completion + parent/current_message_id 只会把新内容追加到会话末尾）。
+     * @param messageId 被编辑用户消息的官方 message_id
      */
+    fun editMessageStream(
+        conversationId: Long,
+        messageId: Long,
+        prompt: String,
+        thinkingEnabled: Boolean = true,
+        searchEnabled: Boolean = false,
+        onThinking: (String) -> Unit = {}
+    ): Flow<String> = flow {
+        val tk = token() ?: throw IllegalStateException("未登录 DeepSeek 官网账号")
+        var sid = sessionId(conversationId)
+        if (sid.isNullOrBlank()) {
+            sid = client.createSession(tk)
+            prefs.edit().putString(sessionKey(conversationId), sid).apply()
+        }
+        emitAll(
+            client.editMessageStream(
+                token = tk,
+                sessionId = sid,
+                messageId = messageId,
+                prompt = prompt,
+                thinkingEnabled = thinkingEnabled,
+                searchEnabled = searchEnabled,
+                onMessageId = { id ->
+                    if (id != null) {
+                        prefs.edit().putLong(parentKey(conversationId), id).apply()
+                    }
+                },
+                onRequestMessageId = { id ->
+                    if (id != null) {
+                        prefs.edit().putLong("last_user_message_id_$conversationId", id).apply()
+                    }
+                },
+                onThinking = onThinking
+            )
+        )
+    }
+
+    /** 该对话最近一条 AI 回复的官方 message_id（chatStream 每次成功后由 onMessageId 记录）。 */
     fun lastAssistantReplyId(cid: Long): Long? = parentMessageId(cid)
 
     /** 重置某对话的官网会话（新对话 = 官网新会话）；同时清理旧版全局 key 完成迁移 */
@@ -188,9 +227,23 @@ class DeepSeekWebRepository(
         return runCatching {
             val needle = normalizeWebContent(content)
             if (needle.isBlank()) return@runCatching null
-            val history = client.fetchHistory(tk, sid)
-            history.firstOrNull { (role == null || it.role == role) && normalizeWebContent(it.content) == needle }?.id
-                ?: history.firstOrNull { (role == null || it.role == role) && normalizeWebContent(it.content).contains(needle) }?.id
+            val history = client.fetchHistory(tk, sid).filter { role == null || it.role == role }
+            // 取「最后一次」匹配（用户消息在官网上带注入前缀，原文在结尾；避免命中更早的重复消息）
+            history.lastOrNull { normalizeWebContent(it.content) == needle }?.id
+                ?: history.lastOrNull { normalizeWebContent(it.content).contains(needle) }?.id
+        }.getOrNull()
+    }
+
+    /**
+     * 返回某条官网消息的父消息 id（编辑/改写时新消息应接在父消息之下）。
+     * 直接从官网历史里取 parent_id，比按正文匹配"上一条消息"更可靠。
+     */
+    suspend fun findParentIdOf(conversationId: Long, messageId: Long): Long? {
+        if (messageId <= 0) return null
+        val tk = token() ?: return null
+        val sid = sessionId(conversationId) ?: return null
+        return runCatching {
+            client.fetchHistory(tk, sid).firstOrNull { it.id == messageId }?.parentId
         }.getOrNull()
     }
 
@@ -206,6 +259,40 @@ class DeepSeekWebRepository(
             val needle = replyBody.trim()
             client.fetchHistory(tk, sid).firstOrNull { it.role == "assistant" && it.content.trim() == needle }?.parentId
         }.getOrNull()
+    }
+
+    /**
+     * 编辑同步替换：把官网某条消息及其全部后续回复删除（best-effort）。
+     * 编辑用户消息前调用，随后用该消息的「官网父消息 id」作 parent 重发编辑内容，
+     * 官网界面表现为"修改输入"——原消息消失、编辑后的内容替换在原位置，
+     * 而不是"新内容追加发出、原消息没变"。
+     * @param targetId 被编辑消息的官方 message_id（由 findMessageIdByContent 解析）
+     * @return 是否至少成功删除了目标消息
+     */
+    suspend fun deleteMessageBranchOnOfficial(conversationId: Long, targetId: Long): Boolean {
+        val tk = token() ?: return false
+        val sid = sessionId(conversationId) ?: return false
+        if (targetId <= 0) return false
+        return runCatching {
+            val history = client.fetchHistory(tk, sid)
+            // 按 parentId 建树，BFS 收集目标消息及其所有后代（不删祖先，新消息要接在其后）
+            val children = history.groupBy { it.parentId }
+            val toDelete = LinkedHashSet<Long>()
+            val queue = ArrayDeque<Long>()
+            toDelete.add(targetId)
+            queue.add(targetId)
+            while (queue.isNotEmpty()) {
+                val id = queue.removeFirst()
+                children[id]?.forEach { node ->
+                    node.id?.let { childId ->
+                        if (toDelete.add(childId)) queue.add(childId)
+                    }
+                }
+            }
+            var ok = false
+            toDelete.forEach { id -> ok = client.deleteMessage(tk, sid, id) || ok }
+            ok
+        }.getOrDefault(false)
     }
 
     /**

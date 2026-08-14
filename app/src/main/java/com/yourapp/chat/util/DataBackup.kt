@@ -25,6 +25,7 @@ object DataBackup {
         val dbPath = context.getDatabasePath(DB_FILE)
         val prefsDir = File(context.dataDir, "shared_prefs")
         val crashLog = File(context.filesDir, "crash.log")
+        val mediaDir = File(context.filesDir, "media")
         var count = 0
         val out = context.contentResolver.openOutputStream(uri, "wt")
             ?: throw IllegalStateException("无法写入所选位置")
@@ -45,6 +46,17 @@ object DataBackup {
                     zip.closeEntry()
                     count++
                 }
+            // 图标/图片资源（角色卡、世界书等外部文件），递归打包，保留相对路径
+            if (mediaDir.isDirectory) {
+                val base = mediaDir.absolutePath
+                mediaDir.walkBottomUp().filter { it.isFile }.forEach { f ->
+                    val rel = f.absolutePath.removePrefix(base).trimStart('/', '\\')
+                    zip.putNextEntry(ZipEntry("media/$rel"))
+                    f.inputStream().use { it.copyTo(zip) }
+                    zip.closeEntry()
+                    count++
+                }
+            }
             if (crashLog.exists()) {
                 zip.putNextEntry(ZipEntry("crash.log"))
                 crashLog.inputStream().use { it.copyTo(zip) }
@@ -52,7 +64,7 @@ object DataBackup {
                 count++
             }
         }
-        "已导出 $count 个文件（数据库 + 设置 + 日志）。\n注意：备份包含 API 密钥与官网登录信息，请妥善保管。"
+        "已导出 $count 个文件（数据库 + 设置 + 图片 + 日志）。\n注意：备份包含 API 密钥与官网登录信息，请妥善保管。"
     }
 
     /** 从 zip 恢复数据。返回界面提示文本 */
@@ -66,7 +78,8 @@ object DataBackup {
             while (e != null) {
                 if (!e.isDirectory) {
                     val name = e.name
-                    if (name.startsWith("db/") || name.startsWith("prefs/") || name == "crash.log") {
+                    if (name.startsWith("db/") || name.startsWith("prefs/")
+                        || name.startsWith("media/") || name == "crash.log") {
                         val bytes = zip.readBytes()
                         entries[name] = bytes
                         total += bytes.size
@@ -95,11 +108,14 @@ object DataBackup {
         listOf(dbPath, File(dbPath.path + "-wal"), File(dbPath.path + "-shm")).forEach { moveToBak(it) }
         prefsDir.listFiles()?.filter { it.isFile && it.name.endsWith(".xml") }?.forEach { moveToBak(it) }
         moveToBak(crashLog)
+        val mediaDir = File(context.filesDir, "media")
+        if (mediaDir.isDirectory) mediaDir.walkTopDown().sortedByDescending { it.absolutePath.length }.forEach { moveToBak(it) }
 
         entries.forEach { (name, bytes) ->
             val target = when {
                 name.startsWith("db/") -> File(dbPath.parentFile, name.removePrefix("db/"))
                 name.startsWith("prefs/") -> File(prefsDir, name.removePrefix("prefs/"))
+                name.startsWith("media/") -> File(mediaDir, name.removePrefix("media/"))
                 else -> crashLog
             }
             target.parentFile?.mkdirs()

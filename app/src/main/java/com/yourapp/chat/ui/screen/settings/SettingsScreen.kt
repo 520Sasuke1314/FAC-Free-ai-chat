@@ -167,8 +167,7 @@ fun SettingsScreen(
                     onClick = {
                         configRepo.setNickname(nickname.trim())
                         configRepo.setPersona(persona.trim())
-                    },
-                    enabled = nickname.isNotBlank() || persona.isNotBlank()
+                    }
                 ) { Text("保存个人设置") }
             }
             HorizontalDivider(Modifier.padding(vertical = 8.dp))

@@ -154,7 +154,6 @@ import com.yourapp.chat.data.local.entity.MessageEntity
 import com.yourapp.chat.data.local.entity.WorldBookEntity
 import com.yourapp.chat.data.local.entity.WorldEntryEntity
 import com.yourapp.chat.data.remote.ApiTester
-import com.yourapp.chat.data.remote.ShizukuHelper
 
 /** 流式跟随阈值：视口顶部若干条以内视为「停留在生成区域」，保持平滑跟随；超过即停止跟随 */
 private const val FOLLOW_THRESHOLD = 3
@@ -253,28 +252,6 @@ fun ChatScreen(
     val conv = state.conversation
     // 是否官网免费对话（deepseek_web）：决定设置项、消息操作与时间显示
     val isWeb = state.apiProfiles.firstOrNull { it.id == state.selectedProfileId }?.provider == "deepseek_web"
-    // Shizuku 授权监听器：仅注册一次；用户点击授权后回调给 ViewModel
-    DisposableEffect(Unit) {
-        val binder = ShizukuHelper.addRequestPermissionListener { requestCode, grantResult ->
-            if (requestCode == ShizukuHelper.REQUEST_CODE) {
-                vm.onShizukuResult(grantResult == android.content.pm.PackageManager.PERMISSION_GRANTED)
-            }
-        }
-        onDispose { ShizukuHelper.removeRequestPermissionListener(binder) }
-    }
-    // 当 shizukuGrantRequested 为 true 时，尝试弹出授权窗口（只处理一次）
-    LaunchedEffect(state.shizukuGrantRequested) {
-        if (state.shizukuGrantRequested) {
-            if (!ShizukuHelper.isAvailable()) {
-                vm.onShizukuResult(false)
-                android.widget.Toast.makeText(context, "未检测到 Shizuku，请安装并启动 Shizuku 应用", android.widget.Toast.LENGTH_LONG).show()
-            } else if (!ShizukuHelper.isGranted()) {
-                ShizukuHelper.requestPermission()
-            } else {
-                vm.onShizukuResult(true)
-            }
-        }
-    }
     // 聊天页 ↔ 对话设置页：与导航页面切换相同的淡入淡出（Crossfade 交叉溶解，
     // 过渡期两层短暂共存，结束后不含残留透明层，滚动性能不受影响）
     Crossfade(
@@ -309,7 +286,9 @@ fun ChatScreen(
             savedVisionModels = state.savedVisionModels,
             onBack = { vm.toggleSettings() },
             injectionInterval = state.injectionInterval,
-            onInjectionIntervalChange = { vm.setInjectionInterval(it) }
+            onInjectionIntervalChange = { vm.setInjectionInterval(it) },
+            searchEnabled = state.searchEnabled,
+            onSearchEnabledChange = { vm.setSearchEnabled(it) }
         )
         if (state.showModelPicker) {
             val curProfile = state.apiProfiles.firstOrNull { it.id == state.selectedProfileId }
@@ -687,9 +666,9 @@ var followStream by remember { mutableStateOf(true) }
                         }
                     }
                 }
-                // 自建 API 联网搜索：显示"正在浏览网页…"
+                // 上下文压缩进行中：显示"正在总结…"动画
                 AnimatedVisibility(
-                    visible = state.webBrowsing,
+                    visible = state.isCompressing,
                     enter = expandVertically(
                         expandFrom = androidx.compose.ui.Alignment.Top,
                         animationSpec = tween(200)
@@ -711,11 +690,7 @@ var followStream by remember { mutableStateOf(true) }
                             color = MaterialTheme.colorScheme.primary
                         )
                         Spacer(Modifier.width(8.dp))
-                        Text(
-                            text = "正在浏览网页…",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                        AnimatedDots(text = "正在总结", paddingTop = 0)
                     }
                 }
                 HorizontalDivider()
@@ -835,7 +810,8 @@ val reversedMessages = remember(state.messages) { state.messages.asReversed() }
                     key = { it.id },
                     contentType = { m -> if (m.role == "system") "system" else if (m.role == "user") "user" else "assistant" }
                 ) { msg ->
-                    // system 消息（角色卡提示/世界信息/早期总结）为注入内容，对用户不可。?
+                    // system 消息（角色卡提示/世界信息）为注入内容，对用户不可见；
+                    // 但「早期总结」是压缩上下文的结果，需要展示给用户看（在保留消息之前）
                     if (msg.role != "system") {
                         val generating = generatingMsgId != null && generatingMsgId == msg.id
                         // 预解析生成中消息的思。?正文部分，避。?MessageBubble 重复计算正则
@@ -858,6 +834,21 @@ val reversedMessages = remember(state.messages) { state.messages.asReversed() }
                             isWeb = isWeb,
                             highlighted = msg.id == highlightId,
                             onEditRequest = { editingMessage = it }
+                        )
+                    } else if (msg.content.startsWith("[对话早期总结")) {
+                        // 上下文压缩的结果：以可见的总结卡片形式展示
+                        MessageBubble(
+                            message = msg,
+                            vm = vm,
+                            generating = false,
+                            streamingContent = null,
+                            precomputedThinking = null,
+                            precomputedBody = null,
+                            showThinkingEnabled = false,
+                            deepThinking = false,
+                            isWeb = isWeb,
+                            highlighted = false,
+                            onEditRequest = { }
                         )
                     }
                 }
@@ -1014,8 +1005,7 @@ private fun EditMessageDialog(
         },
         confirmButton = {
             TextButton(
-                onClick = { onConfirm(text.trim()) },
-                enabled = text.isNotBlank()
+                onClick = { onConfirm(text.trim()) }
             ) { Text(if (isUser) "确认并重新生成" else "保存修改") }
         },
         dismissButton = {
@@ -1494,7 +1484,7 @@ val stripped = if (isWeb) raw.replace(ReferenceRegex, "").trim() else raw
                 Spacer(Modifier.width(10.dp))
             }
             if (isUser) {
-                // 用户消息：回溯（官网免费不支持，隐藏）/ 编辑 / 删除 / 复制 / 喜欢
+                // 用户消息：回溯（官网免费不支持，隐藏）/ 编辑 / 删除（官网免费不支持，隐藏）/ 复制 / 喜欢
                 if (!isWeb) {
                     MessageAction(
                         icon = Icons.Filled.CallSplit,
@@ -1507,11 +1497,13 @@ val stripped = if (isWeb) raw.replace(ReferenceRegex, "").trim() else raw
                     label = "编辑",
                     onClick = { onEditRequest(message) }
                 )
-                MessageAction(
-                    icon = Icons.Filled.Delete,
-                    label = "删除",
-                    onClick = { vm.deleteMessage(message.id) }
-                )
+                if (!isWeb) {
+                    MessageAction(
+                        icon = Icons.Filled.Delete,
+                        label = "删除",
+                        onClick = { vm.deleteMessage(message.id) }
+                    )
+                }
                 MessageAction(
                     icon = Icons.Filled.ContentCopy,
                     label = "复制",
@@ -2152,7 +2144,9 @@ private fun ChatSettingsPage(
     savedVisionModels: List<com.yourapp.chat.data.local.entity.SavedModelEntity>,
     onBack: () -> Unit,
     injectionInterval: Int,
-    onInjectionIntervalChange: (Int) -> Unit
+    onInjectionIntervalChange: (Int) -> Unit,
+    searchEnabled: Boolean,
+    onSearchEnabledChange: (Boolean) -> Unit
 ) {
     var showThinking by remember { mutableStateOf(conversation.showThinking) }
     var maxTokens by remember { mutableStateOf(conversation.maxOutputTokens.toString()) }
@@ -2246,6 +2240,21 @@ private fun ChatSettingsPage(
                     Switch(checked = showThinking, onCheckedChange = { showThinking = it })
                 }
             }
+            // 联网搜索：仅官网免费通道原生支持（自建 API 联网搜索功能已移除）
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("联网搜索", modifier = Modifier.weight(1f))
+                Switch(
+                    checked = searchEnabled,
+                    onCheckedChange = onSearchEnabledChange,
+                    enabled = isWeb
+                )
+            }
+            Text(
+                if (isWeb) "官网免费通道原生支持联网搜索（与官网网页版一致）" else "自建 API 不支持联网搜索，仅官网免费通道可用",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline
+            )
             }
             Spacer(Modifier.height(12.dp))
             SettingsSectionCard("模型") {
@@ -2345,7 +2354,7 @@ private fun ChatSettingsPage(
                 OutlinedTextField(
                     value = keep,
                     onValueChange = { keep = it.filter { c -> c.isDigit() } },
-                    label = { Text("压缩上下文保留条数（默认 32 条）") },
+                    label = { Text("压缩上下文保留条数（默认=当前对话消息总数，当前 $keepCount）") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )

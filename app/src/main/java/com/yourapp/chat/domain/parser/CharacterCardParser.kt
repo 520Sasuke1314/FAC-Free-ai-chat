@@ -299,4 +299,36 @@ object CharacterCardParser {
         val priority: Int = 100,
         val comment: String? = null
     )
+
+    /** 从世界书文件字节中提取标题（SillyTavern world info 的 name/title 字段），取不到返回 null */
+    fun extractWorldName(bytes: ByteArray): String? {
+        val isPng = bytes.size >= 8 &&
+                bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() &&
+                bytes[2] == 0x4E.toByte() && bytes[3] == 0x47.toByte()
+        val json: String = if (isPng) {
+            runCatching {
+                val png = java.io.File.createTempFile("tmp", ".png")
+                try {
+                    png.writeBytes(bytes)
+                    val charaJson = extractCharaFromPng(png) ?: return@runCatching null
+                    String(android.util.Base64.decode(charaJson, android.util.Base64.DEFAULT), Charsets.UTF_8)
+                } finally { png.delete() }
+            }.getOrNull() ?: return null
+        } else {
+            String(bytes, Charsets.UTF_8)
+        }
+        return runCatching {
+            val root = JsonParser.parseString(json).asJsonObject
+            val obj: JsonObject? = if (root.has("data") && root.get("data").isJsonObject) {
+                root.getAsJsonObject("data")
+            } else root
+            val world = obj?.get("world")?.takeIf { it.isJsonObject }?.asJsonObject
+            val name = root.get("name")?.takeIf { it.isJsonPrimitive }?.asString
+                ?: root.get("title")?.takeIf { it.isJsonPrimitive }?.asString
+                ?: world?.get("name")?.takeIf { it.isJsonPrimitive }?.asString
+                ?: world?.get("title")?.takeIf { it.isJsonPrimitive }?.asString
+                ?: obj?.get("name")?.takeIf { it.isJsonPrimitive }?.asString
+            name?.trim()?.takeIf { it.isNotBlank() }
+        }.getOrNull()
+    }
 }
